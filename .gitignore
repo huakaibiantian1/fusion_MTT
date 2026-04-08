@@ -1,0 +1,14 @@
+logs/
+checkpoints/
+checkpoints_1/
+checkpoints_2/
+
+checkpoints_radar_crossing/
+checkpoints_star_crossing/
+logs_radar_crossing/
+logs_star_crossing/
+evaluation/
+evaluation_results/
+evaluation_results_3d/
+evaluation_results_cross/
+evaluation_results_star/

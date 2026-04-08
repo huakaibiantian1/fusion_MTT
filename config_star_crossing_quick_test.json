@@ -1,0 +1,49 @@
+{
+    "model": {
+        "d_model": 256,
+        "nhead": 8,
+        "num_encoder_layers": 6,
+        "num_associate_decoder_layers": 3,
+        "num_filtering_decoder_layers": 6,
+        "dim_feedforward_encoder": 2048,
+        "dim_feedforward_associate": 1024,
+        "dim_feedforward_filtering": 2048,
+        "dropout": 0.1,
+        "max_targets": 20
+    },
+    "data": {
+        "task_type": 1,
+        "num_train_scenarios": 50,
+        "num_val_scenarios": 10,
+        "num_test_scenarios": 10,
+        "tau": 4,
+        "max_measurements": 30,
+        "batch_size": 8,
+        "num_workers": 0,
+        "crossing_probability": 1.0,
+        "star_crossing_probability": 1.0,
+        "num_star_trajectories": [4, 6]
+    },
+    "training": {
+        "num_steps": 1000,
+        "lr": 0.0001,
+        "weight_decay": 1e-05,
+        "grad_clip": 1.0,
+        "association_weight": 1.0,
+        "filtering_weight": 1.0,
+        "gamma": 1.0,
+        "lr_scheduler": {
+            "type": "step",
+            "step_size": 500,
+            "gamma": 0.5
+        }
+    },
+    "logging": {
+        "log_interval": 50,
+        "val_interval": 500,
+        "save_interval": 500,
+        "save_dir": "checkpoints_star_test",
+        "log_dir": "logs_star_test"
+    },
+    "description": "快速测试配置：100%星形交叉场景（6-8条轨迹），用于验证功能是否正常工作。"
+}

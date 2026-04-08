@@ -1,0 +1,43 @@
+{
+  "description": "快速测试配置 - 用于验证交叉场景训练（约15-20分钟）",
+  
+  "data": {
+    "num_train_scenarios": 100,
+    "num_val_scenarios": 20,
+    "num_test_scenarios": 20,
+    "batch_size": 16,
+    "tau": 4,
+    "max_measurements": 30,
+    "task_type": 1,
+    "num_workers": 0
+  },
+  
+  "model": {
+    "d_model": 256,
+    "nhead": 8,
+    "num_encoder_layers": 6,
+    "num_associate_decoder_layers": 3,
+    "num_filtering_decoder_layers": 6,
+    "dim_feedforward_encoder": 2048,
+    "dim_feedforward_associate": 1024,
+    "dim_feedforward_filtering": 2048,
+    "max_targets": 20
+  },
+  
+  "training": {
+    "max_steps": 5000,
+    "val_interval": 500,
+    "save_interval": 1000,
+    "log_interval": 100,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "association_weight": 1.0,
+    "filtering_weight": 1.0
+  },
+  
+  "paths": {
+    "checkpoint_dir": "checkpoints_crossing_test",
+    "log_dir": "runs_crossing_test"
+  }
+}
