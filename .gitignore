@@ -1,4 +1,5 @@
 logs/
+logs_multi/
 checkpoints/
 checkpoints_1/
 checkpoints_2/
@@ -12,3 +13,12 @@ evaluation_results/
 evaluation_results_3d/
 evaluation_results_cross/
 evaluation_results_star/
+checkpoints_multi/
+eval_crossing/
+eval_gui/
+eval_high_maneuver/
+eval_many_targets/
+eval_spindle/
+eval_gui/
+eval_val_spindle/
+eval_val_crossing/

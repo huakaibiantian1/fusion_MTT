@@ -3,6 +3,7 @@ BAIT模型训练脚本
 """
 
 import os
+import sys
 import time
 import argparse
 import json
@@ -28,6 +29,16 @@ except ImportError:
     CROSSING_AVAILABLE = False
     print("⚠️ Warning: data_generation_with_crossing not found, using standard data generation")
 
+# 🔥 导入多场景数据生成器
+try:
+    from data_generation_multi_scenario import (
+        create_dataloaders_multi_scenario, SCENARIO_TYPES, create_pertype_val_loaders
+    )
+    MULTI_AVAILABLE = True
+except ImportError:
+    MULTI_AVAILABLE = False
+    print("⚠️ Warning: data_generation_multi_scenario not found")
+
 
 def parse_args():
     """解析命令行参数（仅保留必要参数）"""
@@ -50,8 +61,31 @@ def parse_args():
                         help='Use crossing trajectory scenarios in training data')
     parser.add_argument('--crossing-prob', type=float, default=0.5,
                         help='Probability of generating crossing scenarios (0.0-1.0)')
+
+    # 多场景参数（覆盖 --use-crossing）
+    parser.add_argument('--use-multi', action='store_true',
+                        help='Use multi-scenario training data (crossing / many_targets / high_maneuver / spindle)')
     
     return parser.parse_args()
+
+
+class TeeLogger:
+    """同时向终端和 txt 文件输出所有 print 内容"""
+    def __init__(self, filepath):
+        self.terminal = sys.stdout
+        self.log      = open(filepath, 'w', encoding='utf-8', buffering=1)
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        sys.stdout = self.terminal
+        self.log.close()
 
 
 def set_seed(seed):
@@ -196,58 +230,117 @@ def main():
     # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-    
-    # 保存配置
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 日志同时写入 txt 文件
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_txt    = os.path.join(log_dir, f'train_log_{timestamp}.txt')
+    tee_logger = TeeLogger(log_txt)
+    sys.stdout = tee_logger
+    print(f"训练日志将同步写入: {log_txt}\n")
     config_save_path = os.path.join(save_dir, f'config_{timestamp}.json')
     config.save_config(config_save_path)
     
     # 创建数据加载器
     print("创建数据加载器...")
-    # 🔥 根据参数选择数据生成器
-    if args.use_crossing and CROSSING_AVAILABLE:
-        crossing_prob = config.get('data', 'crossing_probability', default=args.crossing_prob)
+
+    _common_loader_kwargs = dict(
+        num_train_scenarios=config.get('data', 'num_train_scenarios', default=2000),
+        num_val_scenarios=config.get('data', 'num_val_scenarios', default=200),
+        num_test_scenarios=config.get('data', 'num_test_scenarios', default=200),
+        batch_size=config.get('data', 'batch_size', default=64),
+        tau=config.get('data', 'tau', default=4),
+        max_targets=config.get('model', 'max_targets', default=20),
+        max_measurements=config.get('data', 'max_measurements', default=30),
+        task_type=config.get('data', 'task_type', default=1),
+        num_workers=config.get('data', 'num_workers', default=0),
+        crossing_probability=config.get('data', 'crossing_probability', default=0.7),
+    )
+
+    # 🔥 多场景模式（crossing / many_targets / high_maneuver / spindle）
+    if args.use_multi and MULTI_AVAILABLE:
         print(f"\n{'='*60}")
-        print(f"使用包含两两交叉场景的训练数据（3D雷达）")
-        print(f"  交叉场景概率: {crossing_prob * 100:.0f}%")
+        print("使用多场景训练数据（4 种类型等量混合）")
+        print(f"  类型: {SCENARIO_TYPES}")
         print(f"{'='*60}\n")
 
-        train_loader, val_loader, test_loader = create_dataloaders_with_crossing(
-            num_train_scenarios=config.get('data', 'num_train_scenarios', default=800),
-            num_val_scenarios=config.get('data', 'num_val_scenarios', default=100),
-            num_test_scenarios=config.get('data', 'num_test_scenarios', default=100),
-            batch_size=config.get('data', 'batch_size', default=16),
-            tau=config.get('data', 'tau', default=4),
-            max_targets=config.get('model', 'max_targets', default=20),
-            max_measurements=config.get('data', 'max_measurements', default=30),
-            task_type=config.get('data', 'task_type', default=1),
-            num_workers=config.get('data', 'num_workers', default=0),
-            crossing_probability=crossing_prob,
+        train_loader, val_loader, test_loader, \
+            test_scenarios_by_type, train_scenarios_by_type, val_scenarios_by_type = \
+            create_dataloaders_multi_scenario(**_common_loader_kwargs)
+
+        # 按场景类型创建独立验证 loader（用于分类型统计指标）
+        _pertype_kwargs = dict(
+            tau=_common_loader_kwargs['tau'],
+            max_targets=_common_loader_kwargs['max_targets'],
+            max_measurements=_common_loader_kwargs['max_measurements'],
+            task_type=_common_loader_kwargs.get('task_type', 1),
+            batch_size=_common_loader_kwargs['batch_size'],
+            num_workers=_common_loader_kwargs['num_workers'],
         )
+        pertype_val_loaders = create_pertype_val_loaders(val_scenarios_by_type, **_pertype_kwargs)
+
+        # 保存各类型测试集 pkl
+        for stype, scenarios in test_scenarios_by_type.items():
+            pkl_path = os.path.join(save_dir, f'test_scenarios_{stype}.pkl')
+            with open(pkl_path, 'wb') as _f:
+                pickle.dump(scenarios, _f)
+            print(f"测试集 '{stype}' 已保存 → {pkl_path}（{len(scenarios)} 条）")
+
+        # 保存各类型验证集 pkl（seed=142，用于训练后评估）
+        for stype, scenarios in val_scenarios_by_type.items():
+            pkl_path = os.path.join(save_dir, f'val_scenarios_{stype}.pkl')
+            with open(pkl_path, 'wb') as _f:
+                pickle.dump(scenarios, _f)
+            print(f"验证集 '{stype}' 已保存 → {pkl_path}（{len(scenarios)} 条）")
+
+        # 保存各类型训练集 pkl（用于数据泄露验证，确认模型是否拟合训练数据）
+        for stype, scenarios in train_scenarios_by_type.items():
+            pkl_path = os.path.join(save_dir, f'train_scenarios_{stype}.pkl')
+            with open(pkl_path, 'wb') as _f:
+                pickle.dump(scenarios, _f)
+            print(f"训练集 '{stype}' 已保存 → {pkl_path}（{len(scenarios)} 条）")
+
+    elif args.use_crossing and CROSSING_AVAILABLE:
+        print(f"\n{'='*60}")
+        print("使用包含两两交叉场景的训练数据（3D雷达）")
+        print(f"{'='*60}\n")
+
+        train_loader, val_loader, test_loader = \
+            create_dataloaders_with_crossing(**_common_loader_kwargs)
+        pertype_val_loaders = {}
+
+        if hasattr(test_loader.dataset, 'scenarios'):
+            pkl_path = os.path.join(save_dir, 'test_scenarios.pkl')
+            with open(pkl_path, 'wb') as _f:
+                pickle.dump(test_loader.dataset.scenarios, _f)
+            print(f"测试集场景已保存 → {pkl_path}（{len(test_loader.dataset.scenarios)} 条）")
+
     else:
+        if args.use_multi and not MULTI_AVAILABLE:
+            print("⚠️ --use-multi 指定但模块未找到，回退到标准数据生成")
         if args.use_crossing and not CROSSING_AVAILABLE:
-            print("⚠️ Warning: --use-crossing specified but crossing module not available, using standard data")
+            print("⚠️ --use-crossing 指定但模块未找到，回退到标准数据生成")
+
         train_loader, val_loader, test_loader = create_dataloaders(
-            num_train_scenarios=config.get('data', 'num_train_scenarios', default=800),
-            num_val_scenarios=config.get('data', 'num_val_scenarios', default=100),
-            num_test_scenarios=config.get('data', 'num_test_scenarios', default=100),
-            batch_size=config.get('data', 'batch_size', default=16),
-            tau=config.get('data', 'tau', default=4),
-            max_targets=config.get('model', 'max_targets', default=20),
-            max_measurements=config.get('data', 'max_measurements', default=30),
-            task_type=config.get('data', 'task_type', default=1),
-            num_workers=config.get('data', 'num_workers', default=0)
+            num_train_scenarios=_common_loader_kwargs['num_train_scenarios'],
+            num_val_scenarios=_common_loader_kwargs['num_val_scenarios'],
+            num_test_scenarios=_common_loader_kwargs['num_test_scenarios'],
+            batch_size=_common_loader_kwargs['batch_size'],
+            tau=_common_loader_kwargs['tau'],
+            max_targets=_common_loader_kwargs['max_targets'],
+            max_measurements=_common_loader_kwargs['max_measurements'],
+            task_type=_common_loader_kwargs['task_type'],
+            num_workers=_common_loader_kwargs['num_workers'],
         )
+        pertype_val_loaders = {}
+        if hasattr(test_loader.dataset, 'scenarios'):
+            pkl_path = os.path.join(save_dir, 'test_scenarios.pkl')
+            with open(pkl_path, 'wb') as _f:
+                pickle.dump(test_loader.dataset.scenarios, _f)
+            print(f"测试集场景已保存 → {pkl_path}（{len(test_loader.dataset.scenarios)} 条）")
+
     print(f"训练批次数: {len(train_loader)}")
     print(f"验证批次数: {len(val_loader)}")
     print(f"测试批次数: {len(test_loader)}")
-
-    # 将测试集原始场景保存到磁盘，供 evaluate_3d.py 直接加载（保证完全一致的场景）
-    if hasattr(test_loader.dataset, 'scenarios'):
-        test_scenarios_path = os.path.join(save_dir, 'test_scenarios.pkl')
-        with open(test_scenarios_path, 'wb') as _f:
-            pickle.dump(test_loader.dataset.scenarios, _f)
-        print(f"测试集场景已保存 → {test_scenarios_path}（{len(test_loader.dataset.scenarios)} 条）")
     
     # 创建模型
     print("创建模型...")
@@ -299,7 +392,7 @@ def main():
     start_step = 0
     if args.resume is not None and os.path.exists(args.resume):
         print(f"从检查点恢复训练: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -360,13 +453,13 @@ def main():
         if step % val_interval == 0:
             print("\n验证中...")
             val_stats = validate(model, val_loader, criterion, device)
-            print(f"验证 - 总损失: {val_stats['loss']:.4f} | "
+            print(f"验证(全量) - 总损失: {val_stats['loss']:.4f} | "
                   f"关联准确率: {val_stats['association_acc']*100:.1f}% | "
                   f"位置误差: {val_stats['pos_error_m']:.1f}m | "
                   f"OSPA: {val_stats['ospa_mean']:.4f} | "
                   f"位置OSPA: {val_stats['ospa_loc_mean']:.4f} | "
                   f"数量OSPA: {val_stats['ospa_card_mean']:.4f}")
-            
+
             writer.add_scalar('val/total_loss', val_stats['loss'], step)
             writer.add_scalar('val/association_loss', val_stats['association_loss'], step)
             writer.add_scalar('val/association_acc', val_stats['association_acc'], step)
@@ -375,6 +468,21 @@ def main():
             writer.add_scalar('val/ospa_mean', val_stats['ospa_mean'], step)
             writer.add_scalar('val/ospa_loc_mean', val_stats['ospa_loc_mean'], step)
             writer.add_scalar('val/ospa_card_mean', val_stats['ospa_card_mean'], step)
+
+            # 按场景类型分别统计关联准确率
+            if pertype_val_loaders:
+                type_accs = {}
+                for stype, pt_loader in pertype_val_loaders.items():
+                    pt_stats = validate(model, pt_loader, criterion, device)
+                    type_accs[stype] = pt_stats['association_acc']
+                    writer.add_scalar(f'val_by_type/{stype}_assoc_acc',
+                                      pt_stats['association_acc'], step)
+                    writer.add_scalar(f'val_by_type/{stype}_pos_error_m',
+                                      pt_stats['pos_error_m'], step)
+                acc_str = " | ".join(
+                    f"{t}: {v*100:.1f}%" for t, v in type_accs.items()
+                )
+                print(f"  分场景关联准确率 → {acc_str}")
             
             # 保存最佳模型
             if val_stats['ospa_mean'] < best_val_ospa:
@@ -423,6 +531,8 @@ def main():
           f"数量OSPA: {test_stats['ospa_card_mean']:.4f}")
     
     writer.close()
+    tee_logger.close()
+    print(f"\n训练日志已保存到: {log_txt}")
 
 
 if __name__ == "__main__":

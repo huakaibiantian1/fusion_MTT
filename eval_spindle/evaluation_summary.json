@@ -1,0 +1,101 @@
+{
+    "checkpoint": "checkpoints_multi\\best_model.pth",
+    "num_scenarios": 15,
+    "scenarios": [
+        {
+            "scenario_id": 1,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 37.60615020321025,
+            "avg_dist_error": 47.2582484355428
+        },
+        {
+            "scenario_id": 2,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 41.33476210239773,
+            "avg_dist_error": 53.37188053988987
+        },
+        {
+            "scenario_id": 3,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 40.874511036891846,
+            "avg_dist_error": 54.75659539913651
+        },
+        {
+            "scenario_id": 4,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 38.12390056570949,
+            "avg_dist_error": 47.11566227749926
+        },
+        {
+            "scenario_id": 5,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 40.92433723751684,
+            "avg_dist_error": 53.342893089125376
+        },
+        {
+            "scenario_id": 6,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 42.969877209836596,
+            "avg_dist_error": 61.794334068147215
+        },
+        {
+            "scenario_id": 7,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 43.47944331774478,
+            "avg_dist_error": 60.82916270140406
+        },
+        {
+            "scenario_id": 8,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 42.26307269419151,
+            "avg_dist_error": 54.25547763566188
+        },
+        {
+            "scenario_id": 9,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 38.169002949094335,
+            "avg_dist_error": 50.664617880795696
+        },
+        {
+            "scenario_id": 10,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 41.66050541577337,
+            "avg_dist_error": 57.116152193284556
+        },
+        {
+            "scenario_id": 11,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 40.99197965179852,
+            "avg_dist_error": 53.559940697256636
+        },
+        {
+            "scenario_id": 12,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 45.34786632785977,
+            "avg_dist_error": 65.34126282675591
+        },
+        {
+            "scenario_id": 13,
+            "avg_assoc_acc": 0.9743589743589745,
+            "avg_ospa": 41.90091120305237,
+            "avg_dist_error": 63.581936376451466
+        },
+        {
+            "scenario_id": 14,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 40.89456038218711,
+            "avg_dist_error": 56.738672279993864
+        },
+        {
+            "scenario_id": 15,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 43.07423606864483,
+            "avg_dist_error": 60.76924443451571
+        }
+    ],
+    "overall": {
+        "avg_assoc_acc": 0.9982905982905983,
+        "avg_ospa": 41.307674424393966,
+        "avg_dist_error": 56.03307205569739
+    }
+}

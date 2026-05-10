@@ -1,0 +1,71 @@
+{
+    "checkpoint": "checkpoints_multi\\best_model.pth",
+    "num_scenarios": 10,
+    "scenarios": [
+        {
+            "scenario_id": 1,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 48.81660130692491,
+            "avg_dist_error": 97.23212029675356
+        },
+        {
+            "scenario_id": 2,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 44.71959597769121,
+            "avg_dist_error": 68.27630149384646
+        },
+        {
+            "scenario_id": 3,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 49.84172997846498,
+            "avg_dist_error": 132.72395714294862
+        },
+        {
+            "scenario_id": 4,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 48.33393840522426,
+            "avg_dist_error": 100.01719666519001
+        },
+        {
+            "scenario_id": 5,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 48.22329333028928,
+            "avg_dist_error": 83.5929209633737
+        },
+        {
+            "scenario_id": 6,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 47.510044850315325,
+            "avg_dist_error": 83.2721082804526
+        },
+        {
+            "scenario_id": 7,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 45.1110893693023,
+            "avg_dist_error": 75.77685337752864
+        },
+        {
+            "scenario_id": 8,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 48.44243498565235,
+            "avg_dist_error": 88.03544483751645
+        },
+        {
+            "scenario_id": 9,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 44.28900200843213,
+            "avg_dist_error": 63.96176692065495
+        },
+        {
+            "scenario_id": 10,
+            "avg_assoc_acc": 1.0,
+            "avg_ospa": 48.132348912869354,
+            "avg_dist_error": 77.50592121323784
+        }
+    ],
+    "overall": {
+        "avg_assoc_acc": 1.0,
+        "avg_ospa": 47.342007912516614,
+        "avg_dist_error": 87.03945911915028
+    }
+}

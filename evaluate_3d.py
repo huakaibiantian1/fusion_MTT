@@ -10,9 +10,11 @@
 场景来源（--scene-source）：
   new        : 每次随机生成新场景（可用 --seed / --crossing-prob 控制）
   test_split : 使用与训练相同的测试集（固定 seed=242，与 create_dataloaders_with_crossing 一致）
+  val_split  : 使用训练时的验证集（固定 seed=142）——真正未参与训练优化的独立集合
 """
 
 import os
+import copy
 import argparse
 import json
 import pickle
@@ -47,14 +49,21 @@ def parse_args():
         epilog="""
 场景来源说明（--scene-source）:
   new         每次重新随机生成，可配合 --seed / --crossing-prob 使用
-  test_split  使用与训练完全一致的测试集（seed=242，与 create_dataloaders_with_crossing 相同）
+  test_split  使用与训练完全一致的测试集（seed=242）
+  val_split   使用训练时的验证集（seed=142），优先加载 checkpoint 目录下的 val_scenarios*.pkl
 
 示例:
   # 新场景（默认）
-  python evaluate_3d.py --checkpoint checkpoints_star_crossing/best_model.pth --scene-source new --num-scenarios 5
+  python evaluate_3d.py --checkpoint checkpoints_multi/best_model.pth --scene-source new --num-scenarios 5
 
   # 训练时的测试集
-  python evaluate_3d.py --checkpoint checkpoints_star_crossing/best_model.pth --scene-source test_split --num-scenarios 10
+  python evaluate_3d.py --checkpoint checkpoints_multi/best_model.pth --scene-source test_split --num-scenarios 10
+
+  # 训练时的验证集（推荐用于模型选择）
+  python evaluate_3d.py --checkpoint checkpoints_multi/best_model.pth --scene-source val_split --num-scenarios 10
+
+  # 直接指定验证集 pkl（多场景分类型评估）
+  python evaluate_3d.py --checkpoint checkpoints_multi/best_model.pth --scenarios-pkl checkpoints_multi/val_scenarios_crossing.pkl
 """
     )
     p.add_argument('--checkpoint',        type=str,   required=True,
@@ -73,10 +82,11 @@ def parse_args():
         '--scene-source',
         type=str,
         default='new',
-        choices=['new', 'test_split'],
+        choices=['new', 'test_split', 'val_split'],
         help=(
             'new        = 随机生成新场景（可用 --seed / --crossing-prob 控制）\n'
-            'test_split = 使用训练时的测试集（固定 seed=242）'
+            'test_split = 使用训练时的测试集（固定 seed=242）\n'
+            'val_split  = 使用训练时的验证集（固定 seed=142，优先加载 val_scenarios*.pkl）'
         )
     )
     # 仅在 --scene-source new 时生效
@@ -93,6 +103,19 @@ def parse_args():
                    help='测试集交叉概率（仅 --scene-source test_split 时有效，与训练 config 保持一致）')
     p.add_argument('--test-star-prob',     type=float, default=0.7,
                    help='测试集星形交叉概率（仅 --scene-source test_split 时有效）')
+
+    # ── 直接指定 pkl 文件（优先级最高，覆盖 --scene-source）────────
+    p.add_argument(
+        '--scenarios-pkl',
+        type=str,
+        default=None,
+        help=(
+            '直接指定场景 pkl 文件路径（优先级高于 --scene-source）。\n'
+            '用于 --use-multi 训练后按类型分别评估，例如：\n'
+            '  --scenarios-pkl checkpoints/test_scenarios_crossing.pkl\n'
+            '  --scenarios-pkl checkpoints/test_scenarios_spindle.pkl'
+        )
+    )
 
     return p.parse_args()
 
@@ -580,9 +603,21 @@ def main():
     print(f"模型加载成功！（来自训练步骤 {ckpt.get('step', '?')}）")
 
     # ── 场景来源 ──────────────────────────────────────────────────
-    print(f"\n场景来源: {args.scene_source.upper()}")
 
-    if args.scene_source == 'new':
+    # 优先级最高：直接指定 pkl 文件（用于多场景分类评估）
+    if args.scenarios_pkl is not None:
+        print(f"\n场景来源: 指定 PKL 文件")
+        print(f"  路径: {args.scenarios_pkl}")
+        with open(args.scenarios_pkl, 'rb') as _f:
+            _all_scenarios = pickle.load(_f)
+        print(f"  共 {len(_all_scenarios)} 条场景，本次评估前 {args.num_scenarios} 条")
+
+        def get_scenario(idx):
+            # deepcopy 防止 evaluate_scenario 的原地归一化污染原始数据
+            return copy.deepcopy(_all_scenarios[idx % len(_all_scenarios)])
+
+    elif args.scene_source == 'new':
+        print(f"\n场景来源: NEW（随机生成）")
         print(f"  随机种子:     {args.seed}")
         print(f"  交叉场景概率: {args.crossing_prob * 100:.0f}%")
         print(f"  星形交叉概率: {args.star_crossing_prob * 100:.0f}%")
@@ -598,7 +633,73 @@ def main():
         def get_scenario(_idx):
             return generator.generate_single_scenario()
 
+    elif args.scene_source == 'val_split':
+        print(f"\n场景来源: VAL_SPLIT（训练时验证集，seed=142）")
+        ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
+
+        # 优先查找 val_scenarios.pkl（crossing-only 训练模式）
+        val_pkl_single = os.path.join(ckpt_dir, 'val_scenarios.pkl')
+        if os.path.exists(val_pkl_single):
+            print(f"  加载验证集场景: {val_pkl_single}")
+            with open(val_pkl_single, 'rb') as _f:
+                all_saved_scenarios = pickle.load(_f)
+            print(f"  共 {len(all_saved_scenarios)} 条场景，本次使用前 {args.num_scenarios} 条")
+            def get_scenario(idx):
+                return copy.deepcopy(all_saved_scenarios[idx % len(all_saved_scenarios)])
+        else:
+            # 没有单文件时，尝试合并 val_scenarios_{type}.pkl（多场景训练模式）
+            try:
+                from data_generation_multi_scenario import SCENARIO_TYPES
+                merged = []
+                for stype in SCENARIO_TYPES:
+                    p_type = os.path.join(ckpt_dir, f'val_scenarios_{stype}.pkl')
+                    if os.path.exists(p_type):
+                        with open(p_type, 'rb') as _f:
+                            merged.extend(pickle.load(_f))
+                        print(f"  加载 val_scenarios_{stype}.pkl（{len(merged)} 条累计）")
+                if merged:
+                    all_saved_scenarios = merged
+                    print(f"  合并后共 {len(all_saved_scenarios)} 条验证集场景，本次使用前 {args.num_scenarios} 条")
+                    def get_scenario(idx):
+                        return copy.deepcopy(all_saved_scenarios[idx % len(all_saved_scenarios)])
+                else:
+                    raise FileNotFoundError("未找到任何 val_scenarios*.pkl 文件")
+            except FileNotFoundError:
+                # 终极回退：用 seed=142 重新生成（与训练时 create_dataloaders_multi_scenario 一致）
+                print(f"  未找到已保存的验证集 pkl，回退到 seed=142 重新生成")
+                print(f"  ⚠ 请确保 --test-crossing-prob 与训练 config 中的 crossing_probability 一致！")
+                try:
+                    from data_generation_multi_scenario import MTTDatasetMultiScenario, SCENARIO_TYPES
+                    val_ds = MTTDatasetMultiScenario(
+                        num_scenarios_per_type=max(1, args.num_scenarios // len(SCENARIO_TYPES)),
+                        seed=142,
+                        tau=args.tau,
+                        max_targets=args.max_targets,
+                        max_measurements=args.max_measurements,
+                        task_type=args.task_type,
+                        crossing_probability=args.test_crossing_prob,
+                    )
+                    all_saved_scenarios = val_ds.scenarios
+                    print(f"  重新生成 {len(all_saved_scenarios)} 条验证集场景")
+                    def get_scenario(idx):
+                        return copy.deepcopy(all_saved_scenarios[idx % len(all_saved_scenarios)])
+                except Exception:
+                    # 最终回退到 crossing-only 验证集
+                    print(f"  多场景生成器不可用，回退到 crossing-only 验证集（seed=142）")
+                    val_dataset = MTTDatasetWithCrossing(
+                        num_scenarios=args.num_scenarios,
+                        tau=args.tau,
+                        max_targets=args.max_targets,
+                        max_measurements=args.max_measurements,
+                        task_type=args.task_type,
+                        seed=142,
+                        crossing_probability=args.test_crossing_prob,
+                    )
+                    def get_scenario(idx):
+                        return val_dataset.scenarios[idx % len(val_dataset.scenarios)]
+
     else:  # test_split
+        print(f"\n场景来源: TEST_SPLIT")
         # 优先从 checkpoint 同目录加载训练时保存的测试场景文件
         ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
         saved_path = os.path.join(ckpt_dir, 'test_scenarios.pkl')
@@ -609,7 +710,7 @@ def main():
                 all_saved_scenarios = pickle.load(_f)
             print(f"  共 {len(all_saved_scenarios)} 条场景，本次使用前 {args.num_scenarios} 条")
             def get_scenario(idx):
-                return all_saved_scenarios[idx % len(all_saved_scenarios)]
+                return copy.deepcopy(all_saved_scenarios[idx % len(all_saved_scenarios)])
         else:
             # 回退：用相同 seed 重新生成（要求参数与训练完全一致）
             print(f"  [test_split] 未找到 {saved_path}，回退到 seed={args.test_seed} 重新生成")

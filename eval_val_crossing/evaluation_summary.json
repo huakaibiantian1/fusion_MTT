@@ -1,0 +1,71 @@
+{
+    "checkpoint": "checkpoints_multi/best_model.pth",
+    "num_scenarios": 10,
+    "scenarios": [
+        {
+            "scenario_id": 1,
+            "avg_assoc_acc": 0.1346153846153846,
+            "avg_ospa": 41.38887683885532,
+            "avg_dist_error": 5537.221715747229
+        },
+        {
+            "scenario_id": 2,
+            "avg_assoc_acc": 0.9743589743589743,
+            "avg_ospa": 40.263173892339196,
+            "avg_dist_error": 52.193067752012304
+        },
+        {
+            "scenario_id": 3,
+            "avg_assoc_acc": 0.9743589743589743,
+            "avg_ospa": 44.56347098885057,
+            "avg_dist_error": 59.07378252347667
+        },
+        {
+            "scenario_id": 4,
+            "avg_assoc_acc": 0.3205128205128205,
+            "avg_ospa": 44.92271648339909,
+            "avg_dist_error": 3343.7860737352025
+        },
+        {
+            "scenario_id": 5,
+            "avg_assoc_acc": 0.6634615384615384,
+            "avg_ospa": 45.50931765331033,
+            "avg_dist_error": 934.8969390389677
+        },
+        {
+            "scenario_id": 6,
+            "avg_assoc_acc": 0.9743589743589745,
+            "avg_ospa": 41.59831450449094,
+            "avg_dist_error": 67.8048134543809
+        },
+        {
+            "scenario_id": 7,
+            "avg_assoc_acc": 0.9615384615384616,
+            "avg_ospa": 39.69553122159381,
+            "avg_dist_error": 79.60052124289953
+        },
+        {
+            "scenario_id": 8,
+            "avg_assoc_acc": 0.6730769230769231,
+            "avg_ospa": 43.32397708034822,
+            "avg_dist_error": 768.7968487990315
+        },
+        {
+            "scenario_id": 9,
+            "avg_assoc_acc": 0.9519230769230769,
+            "avg_ospa": 40.04499663649211,
+            "avg_dist_error": 54.7650611166968
+        },
+        {
+            "scenario_id": 10,
+            "avg_assoc_acc": 0.9692307692307692,
+            "avg_ospa": 43.13027479698296,
+            "avg_dist_error": 53.73639734257006
+        }
+    ],
+    "overall": {
+        "avg_assoc_acc": 0.7597435897435897,
+        "avg_ospa": 42.44406500966626,
+        "avg_dist_error": 1095.1875220752468
+    }
+}

@@ -383,8 +383,8 @@ class BAITLoss(nn.Module):
         mask = torch.arange(max_targets, device=filtered_states.device).unsqueeze(0) < num_targets.unsqueeze(1)
         loss = (loss * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
 
-        # 缩放到与关联损失同量级（除以 1e6，即 1000m² 量级 → ~1）
-        return loss / 1e6
+        # 缩放到与关联损失同量级（除以 1e9，即 30000m² ≈ 9e8 → ~1）
+        return loss / 1e9
 
 
 if __name__ == "__main__":
