@@ -112,14 +112,15 @@ def train_one_step(model, batch, criterion, optimizer, device, grad_clip=1.0):
     match_prob_matrix, filtered_states, existence_probs = model(
         past_states, current_measurements, num_past_targets, num_current_measurements
     )
-    
-    # 计算损失
+
+    # 计算损失（传入 existence_probs 以启用存在性 BCE 损失）
     total_loss, loss_dict = criterion(
         match_prob_matrix, filtered_states,
         gt_associations, gt_states,
-        num_current_measurements, num_current_targets
+        num_current_measurements, num_current_targets,
+        existence_probs=existence_probs,
     )
-    
+
     # 反向传播
     optimizer.zero_grad()
     total_loss.backward()
@@ -136,13 +137,14 @@ def train_one_step(model, batch, criterion, optimizer, device, grad_clip=1.0):
 def validate(model, val_loader, criterion, device):
     """验证"""
     model.eval()
-    
-    total_loss = 0.0
+
+    total_loss             = 0.0
     total_association_loss = 0.0
-    total_filtering_loss = 0.0
-    total_association_acc = 0.0
-    total_pos_error_m = 0.0
-    num_batches = 0
+    total_filtering_loss   = 0.0
+    total_existence_loss   = 0.0
+    total_association_acc  = 0.0
+    total_pos_error_m      = 0.0
+    num_batches            = 0
     
     metrics = TrackingMetrics(c=1.0, p=1)
     
@@ -161,19 +163,21 @@ def validate(model, val_loader, criterion, device):
             match_prob_matrix, filtered_states, existence_probs = model(
                 past_states, current_measurements, num_past_targets, num_current_measurements
             )
-            
-            # 计算损失
+
+            # 计算损失（传入 existence_probs 以启用存在性 BCE 损失）
             _, loss_dict = criterion(
                 match_prob_matrix, filtered_states,
                 gt_associations, gt_states,
-                num_current_measurements, num_current_targets
+                num_current_measurements, num_current_targets,
+                existence_probs=existence_probs,
             )
-            
-            total_loss += loss_dict['total_loss']
+
+            total_loss             += loss_dict['total_loss']
             total_association_loss += loss_dict['association_loss']
-            total_filtering_loss += loss_dict['filtering_loss']
-            total_association_acc += loss_dict['association_acc']
-            total_pos_error_m += loss_dict['pos_error_m']
+            total_filtering_loss   += loss_dict['filtering_loss']
+            total_existence_loss   += loss_dict.get('existence_loss', 0.0)
+            total_association_acc  += loss_dict['association_acc']
+            total_pos_error_m      += loss_dict['pos_error_m']
             num_batches += 1
             
             # 计算OSPA指标
@@ -188,23 +192,25 @@ def validate(model, val_loader, criterion, device):
                     metrics.update_ospa(pred_states, true_states)
     
     n = num_batches if num_batches > 0 else 1
-    avg_loss = total_loss / n
+    avg_loss             = total_loss             / n
     avg_association_loss = total_association_loss / n
-    avg_filtering_loss = total_filtering_loss / n
-    avg_association_acc = total_association_acc / n
-    avg_pos_error_m = total_pos_error_m / n
+    avg_filtering_loss   = total_filtering_loss   / n
+    avg_existence_loss   = total_existence_loss   / n
+    avg_association_acc  = total_association_acc  / n
+    avg_pos_error_m      = total_pos_error_m      / n
 
     ospa_stats = metrics.get_ospa_stats()
-    
+
     return {
-        'loss': avg_loss,
+        'loss':             avg_loss,
         'association_loss': avg_association_loss,
-        'filtering_loss': avg_filtering_loss,
-        'association_acc': avg_association_acc,
-        'pos_error_m': avg_pos_error_m,
-        'ospa_mean': ospa_stats['mean'],
-        'ospa_loc_mean': ospa_stats['loc_mean'],
-        'ospa_card_mean': ospa_stats['card_mean']
+        'filtering_loss':   avg_filtering_loss,
+        'existence_loss':   avg_existence_loss,
+        'association_acc':  avg_association_acc,
+        'pos_error_m':      avg_pos_error_m,
+        'ospa_mean':        ospa_stats['mean'],
+        'ospa_loc_mean':    ospa_stats['loc_mean'],
+        'ospa_card_mean':   ospa_stats['card_mean'],
     }
 
 
@@ -348,13 +354,17 @@ def main():
         d_model=config.get('model', 'd_model', default=256),
         nhead=config.get('model', 'nhead', default=8),
         num_encoder_layers=config.get('model', 'num_encoder_layers', default=6),
+        num_meas_encoder_layers=config.get('model', 'num_meas_encoder_layers', default=2),
         num_associate_decoder_layers=config.get('model', 'num_associate_decoder_layers', default=3),
         num_filtering_decoder_layers=config.get('model', 'num_filtering_decoder_layers', default=6),
         dim_feedforward_encoder=config.get('model', 'dim_feedforward_encoder', default=2048),
+        dim_feedforward_meas_encoder=config.get('model', 'dim_feedforward_meas_encoder', default=1024),
+        dim_feedforward_bridge=config.get('model', 'dim_feedforward_bridge', default=1024),
         dim_feedforward_associate=config.get('model', 'dim_feedforward_associate', default=1024),
         dim_feedforward_filtering=config.get('model', 'dim_feedforward_filtering', default=2048),
         dropout=config.get('model', 'dropout', default=0.1),
-        max_targets=config.get('model', 'max_targets', default=20)
+        max_targets=config.get('model', 'max_targets', default=20),
+        sinkhorn_iters=config.get('training', 'sinkhorn_iters', default=5),
     ).to(device)
     
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -364,7 +374,8 @@ def main():
     criterion = BAITLoss(
         gamma=config.get('training', 'gamma', default=1.0),
         association_weight=config.get('training', 'association_weight', default=1.0),
-        filtering_weight=config.get('training', 'filtering_weight', default=1.0)
+        filtering_weight=config.get('training', 'filtering_weight', default=1.0),
+        existence_weight=config.get('training', 'existence_weight', default=0.5),
     )
     
     # 创建优化器
@@ -439,15 +450,17 @@ def main():
                   f"关联损失: {loss_dict['association_loss']:.4f} | "
                   f"关联准确率: {loss_dict['association_acc']*100:.1f}% | "
                   f"滤波损失: {loss_dict['filtering_loss']:.4f} | "
+                  f"存在性损失: {loss_dict['existence_loss']:.4f} | "
                   f"位置误差: {loss_dict['pos_error_m']:.1f}m | "
                   f"LR: {optimizer.param_groups[0]['lr']:.2e}")
-            
-            writer.add_scalar('train/total_loss', loss_dict['total_loss'], step)
+
+            writer.add_scalar('train/total_loss',       loss_dict['total_loss'],       step)
             writer.add_scalar('train/association_loss', loss_dict['association_loss'], step)
-            writer.add_scalar('train/association_acc', loss_dict['association_acc'], step)
-            writer.add_scalar('train/filtering_loss', loss_dict['filtering_loss'], step)
-            writer.add_scalar('train/pos_error_m', loss_dict['pos_error_m'], step)
-            writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], step)
+            writer.add_scalar('train/association_acc',  loss_dict['association_acc'],  step)
+            writer.add_scalar('train/filtering_loss',   loss_dict['filtering_loss'],   step)
+            writer.add_scalar('train/existence_loss',   loss_dict['existence_loss'],   step)
+            writer.add_scalar('train/pos_error_m',      loss_dict['pos_error_m'],      step)
+            writer.add_scalar('train/lr',               optimizer.param_groups[0]['lr'], step)
         
         # 验证
         if step % val_interval == 0:
@@ -456,18 +469,20 @@ def main():
             print(f"验证(全量) - 总损失: {val_stats['loss']:.4f} | "
                   f"关联准确率: {val_stats['association_acc']*100:.1f}% | "
                   f"位置误差: {val_stats['pos_error_m']:.1f}m | "
+                  f"存在性损失: {val_stats['existence_loss']:.4f} | "
                   f"OSPA: {val_stats['ospa_mean']:.4f} | "
                   f"位置OSPA: {val_stats['ospa_loc_mean']:.4f} | "
                   f"数量OSPA: {val_stats['ospa_card_mean']:.4f}")
 
-            writer.add_scalar('val/total_loss', val_stats['loss'], step)
+            writer.add_scalar('val/total_loss',       val_stats['loss'],             step)
             writer.add_scalar('val/association_loss', val_stats['association_loss'], step)
-            writer.add_scalar('val/association_acc', val_stats['association_acc'], step)
-            writer.add_scalar('val/filtering_loss', val_stats['filtering_loss'], step)
-            writer.add_scalar('val/pos_error_m', val_stats['pos_error_m'], step)
-            writer.add_scalar('val/ospa_mean', val_stats['ospa_mean'], step)
-            writer.add_scalar('val/ospa_loc_mean', val_stats['ospa_loc_mean'], step)
-            writer.add_scalar('val/ospa_card_mean', val_stats['ospa_card_mean'], step)
+            writer.add_scalar('val/filtering_loss',   val_stats['filtering_loss'],   step)
+            writer.add_scalar('val/existence_loss',   val_stats['existence_loss'],   step)
+            writer.add_scalar('val/association_acc',  val_stats['association_acc'],  step)
+            writer.add_scalar('val/pos_error_m',      val_stats['pos_error_m'],      step)
+            writer.add_scalar('val/ospa_mean',        val_stats['ospa_mean'],        step)
+            writer.add_scalar('val/ospa_loc_mean',    val_stats['ospa_loc_mean'],    step)
+            writer.add_scalar('val/ospa_card_mean',   val_stats['ospa_card_mean'],   step)
 
             # 按场景类型分别统计关联准确率
             if pertype_val_loaders:

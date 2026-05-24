@@ -2,7 +2,7 @@
 多场景训练数据生成模块
 
 支持 4 种场景类型：
-  1. crossing      - 星形交叉：3~5 条轨迹在同一空间点同时汇聚，经过后各自机动散开
+  1. crossing      - 星形交叉：3~10 条轨迹在同一空间点同时汇聚，经过后各自机动散开
   2. many_targets  - 大量目标场景（CV 模型）
   3. high_maneuver - 高机动目标（CA 模型，3 段随机加速度，每段 T/3 帧）
   4. spindle       - 纺锤形（两目标从远处相向接近 → 贴近 → 分离）
@@ -45,7 +45,7 @@ class MTTDataGeneratorMultiScenario(MTTDataGeneratorWithCrossing):
         many_targets_range=(3, 5),            # 多目标场景的目标数范围
         sep_far_range=(3000, 7000),           # 纺锤形最远横向间距范围 (m)
         sep_near_range=(200, 600),            # 纺锤形最近横向间距范围 (m)
-        n_cross_traj=None,                    # 星形交叉固定轨迹数（None=随机3~5）
+        n_cross_traj=None,                    # 星形交叉固定轨迹数（None=随机3~15）
         spindle_crossing=None,                # 纺锤是否交叉：True/False/None(随机50%)
         **kwargs
     ):
@@ -224,7 +224,7 @@ class MTTDataGeneratorMultiScenario(MTTDataGeneratorWithCrossing):
 
     def _generate_crossing_scenario(self):
         """
-        星形交叉场景：3~5 条轨迹在同一空间点同时汇聚，经过后各自机动散开。
+        星形交叉场景：3~15 条轨迹在同一空间点同时汇聚，经过后各自机动散开。
 
         - 随机选取交叉点（空域中心区域）和交叉时刻 t_cross ∈ [T/4, 3T/4]
         - 各轨迹进入方位角均匀分布在 [0, 2π)，仰角随机略有差异
@@ -233,7 +233,7 @@ class MTTDataGeneratorMultiScenario(MTTDataGeneratorWithCrossing):
         """
         for _ in range(30):
             n_traj = (self.n_cross_traj if self.n_cross_traj is not None
-                      else np.random.randint(3, 6))   # 3、4 或 5 条
+                      else np.random.randint(3, 16))  # 3~15 条
 
             # ── 交叉点（空域中心区域） ──
             r_cross   = np.random.uniform(self.r_min * 1.2, self.r_max * 0.8)
@@ -850,7 +850,7 @@ if __name__ == '__main__':
         print(f"  {stype:<14}: {n_tgt} 目标, 共 {n_meas} 条测量")
 
         if stype == 'crossing':
-            print(f"    星形交叉目标数: {n_tgt}（期望 3~5）")
+            print(f"    星形交叉目标数: {n_tgt}（期望 3~15）")
 
         if stype == 'spindle' and len(trajs) >= 2:
             p1 = trajs[0]['states'][:, :3]
@@ -870,7 +870,7 @@ if __name__ == '__main__':
             )
             print(f"  最近距离: {d.min():.1f} m  帧号: {d.argmin()}")
 
-    print("\n验证星形交叉（每场景 3~5 条轨迹）...")
+    print("\n验证星形交叉（每场景 3~15 条轨迹）...")
     np.random.seed(1)
     for _ in range(5):
         trajs, _, _ = gen._generate_crossing_scenario()

@@ -1,5 +1,8 @@
 python train.py --config config_multi_scenario.json --use-multi --device cuda
 
+python train.py --config config_multi_scenario.json --use-multi --device cuda --resume checkpoints_multi/best_model.pth
+
+
 python evaluate_3d.py --checkpoint checkpoints_multi\best_model.pth --scenarios-pkl checkpoints_multi\train_scenarios_crossing.pkl --num-scenarios 10 --output-dir eval_crossing
 
 python evaluate_3d.py --checkpoint checkpoints_multi\best_model.pth --scenarios-pkl checkpoints_multi\train_scenarios_many_targets.pkl --num-scenarios 10 --output-dir eval_many_targets

@@ -14,6 +14,7 @@ evaluation_results_3d/
 evaluation_results_cross/
 evaluation_results_star/
 checkpoints_multi/
+checkpoints_multi_1/
 eval_crossing/
 eval_gui/
 eval_high_maneuver/

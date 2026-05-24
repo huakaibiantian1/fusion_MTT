@@ -153,7 +153,7 @@ class EvaluateGUI:
 
         # crossing 专用
         self._cross_frame = ttk.Frame(self._spec_frame)
-        self._n_traj = self._spin_row(self._cross_frame, '交叉轨迹条数', 4, 3, 5, 0)
+        self._n_traj = self._spin_row(self._cross_frame, '交叉轨迹条数', 4, 3, 15, 0)
         self._cross_frame.pack(fill='x')
 
         # spindle 专用
@@ -318,11 +318,13 @@ class EvaluateGUI:
             )
             scenario = gen.generate_by_type(scene_type)
             print(f'场景生成完毕，目标数: {len(scenario[0])}，帧数: {len(scenario[1])}')
+            eval_max_measurements = max(30, max((len(m) for m in scenario[1]), default=0))
+            print(f'Max measurements in this scenario: {eval_max_measurements}')
 
             # ── 模型评估 ──────────────────────────────────────
             result = evaluate_scenario(
                 model, copy.deepcopy(scenario),
-                tau=4, max_targets=20, max_measurements=30,
+                tau=4, max_targets=20, max_measurements=eval_max_measurements,
                 device=device, scenario_idx=0,
             )
 

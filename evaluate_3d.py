@@ -227,8 +227,9 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
     with torch.no_grad():
         for frame_idx in range(tau, num_frames):
             past_np  = prepare_past_states(tracked_states, trajectories, frame_idx, tau, max_targets, DT, T_TOTAL)
-            meas_np  = prepare_measurements(measurements[frame_idx], max_measurements)
-            n_meas   = len(measurements[frame_idx])
+            meas_np    = prepare_measurements(measurements[frame_idx], max_measurements)
+            n_meas_raw = len(measurements[frame_idx])
+            n_meas     = min(n_meas_raw, max_measurements)
 
             # 每帧实际目标数
             n_past_per_frame = []
@@ -269,7 +270,8 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
             frame_assoc_detail.append(detail_rows)
 
             # 控制台打印
-            print(f"  帧{frame_idx:3d} | 测量总数={n_meas:3d} 真实={int(valid.sum()):2d} 杂波={int((~valid).sum()):2d} | 关联正确率={acc*100:.1f}%")
+            trunc_msg = f"/{n_meas_raw}" if n_meas_raw > n_meas else ""
+            print(f"  帧{frame_idx:3d} | 测量总数={n_meas:3d}{trunc_msg} 真实={int(valid.sum()):2d} 杂波={int((~valid).sum()):2d} | 关联正确率={acc*100:.1f}%")
             for row in detail_rows:
                 mark = "✓" if row['correct'] else "✗"
                 p = row['pos_real']
