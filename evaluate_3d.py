@@ -354,15 +354,15 @@ def plot_3d_trajectories(result, scenario_idx, output_dir):
     # ---- 自适应坐标轴（基于轨迹点，不受杂波范围影响）----
     if traj_pts_all:
         all_traj = np.vstack(traj_pts_all)
-        xmin, xmax = all_traj[:, 0].min(), all_traj[:, 0].max()
-        ymin, ymax = all_traj[:, 1].min(), all_traj[:, 1].max()
-        zmin, zmax = all_traj[:, 2].min(), all_traj[:, 2].max()
-        # 让三轴范围相等，以免图形变形
-        half = max(xmax - xmin, ymax - ymin, zmax - zmin) * 0.55 + 1e-3
-        xc = (xmin + xmax) / 2; yc = (ymin + ymax) / 2; zc = (zmin + zmax) / 2
-        ax.set_xlim(xc - half, xc + half)
-        ax.set_ylim(yc - half, yc + half)
-        ax.set_zlim(zc - half, zc + half)
+        xmin, xmax = np.nanmin(all_traj[:, 0]), np.nanmax(all_traj[:, 0])
+        ymin, ymax = np.nanmin(all_traj[:, 1]), np.nanmax(all_traj[:, 1])
+        zmin, zmax = np.nanmin(all_traj[:, 2]), np.nanmax(all_traj[:, 2])
+        if not any(np.isnan(v) for v in [xmin, xmax, ymin, ymax, zmin, zmax]):
+            half = max(xmax - xmin, ymax - ymin, zmax - zmin) * 0.55 + 1e-3
+            xc = (xmin + xmax) / 2; yc = (ymin + ymax) / 2; zc = (zmin + zmax) / 2
+            ax.set_xlim(xc - half, xc + half)
+            ax.set_ylim(yc - half, yc + half)
+            ax.set_zlim(zc - half, zc + half)
 
     # 测量点：只绘制落在坐标轴范围内的点，避免杂波撑开视野
     xlim = ax.get_xlim(); ylim = ax.get_ylim(); zlim = ax.get_zlim()
@@ -448,13 +448,14 @@ def plot_error_curves(result, scenario_idx, output_dir):
             ax.plot(fr, vals, '-', color=c, linewidth=1.2, alpha=0.7,
                     label=f'Traj {traj["label"]}')
             for f, v in zip(fr, vals):
-                all_vals_by_frame.setdefault(f, []).append(v)
+                if not np.isnan(v):                  # NaN 帧（目标丢失）不计入均值
+                    all_vals_by_frame.setdefault(f, []).append(v)
 
         # 平均线
         if all_vals_by_frame:
             avg_fr  = sorted(all_vals_by_frame.keys())
-            avg_val = [np.mean(all_vals_by_frame[f]) for f in avg_fr]
-            ax.plot(avg_fr, avg_val, 'k--', linewidth=2.2, label=f'Mean={np.mean(avg_val):.2f}m')
+            avg_val = [np.nanmean(all_vals_by_frame[f]) for f in avg_fr]
+            ax.plot(avg_fr, avg_val, 'k--', linewidth=2.2, label=f'Mean={np.nanmean(avg_val):.2f}m')
 
         ax.set_xlabel('Frame', fontsize=11)
         ax.set_ylabel(ylabel, fontsize=11)
@@ -488,7 +489,12 @@ def plot_ospa_curve(result, scenario_idx, output_dir):
         if len(pred) == 0 and len(true) == 0:
             ospa_vals.append(0.0); ospa_loc_vals.append(0.0); ospa_card_vals.append(0.0)
             continue
-        pred3 = pred if len(pred) > 0 else np.empty((0, 3))
+        # 过滤 NaN 行：NaN 表示该目标丢失，OSPA 按漏检（基数误差）计
+        if len(pred) > 0:
+            valid = ~np.any(np.isnan(pred), axis=1)
+            pred3 = pred[valid] if valid.any() else np.empty((0, 3))
+        else:
+            pred3 = np.empty((0, 3))
         true3 = true if len(true) > 0 else np.empty((0, 3))
         d, loc, card = ospa_metric(pred3, true3)
         ospa_vals.append(d); ospa_loc_vals.append(loc); ospa_card_vals.append(card)
