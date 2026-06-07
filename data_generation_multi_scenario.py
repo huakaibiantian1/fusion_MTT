@@ -62,21 +62,24 @@ class MTTDataGeneratorMultiScenario(MTTDataGeneratorWithCrossing):
     # ----------------------------------------------------------
 
     def generate_by_type(self, scenario_type: str):
-        """按名称生成单个场景，返回 (trajectories, measurements, associations)"""
         if scenario_type == 'crossing':
-            return self._generate_crossing_scenario()
+            scenario = self._generate_crossing_scenario()
         elif scenario_type == 'many_targets':
-            return self._generate_many_targets_scenario()
+            scenario = self._generate_many_targets_scenario()
         elif scenario_type == 'high_maneuver':
-            return self._generate_high_maneuver_scenario()
+            scenario = self._generate_high_maneuver_scenario()
         elif scenario_type == 'spindle':
-            return self._generate_spindle_scenario()
+            scenario = self._generate_spindle_scenario()
         else:
             raise ValueError(f"Unknown scenario type: {scenario_type!r}")
 
-    # ----------------------------------------------------------
-    # 公共辅助：从轨迹列表生成含噪测量
-    # ----------------------------------------------------------
+        trajectories, _, _ = scenario
+        trajectories = self._randomize_trajectory_lifetimes(trajectories)
+        if not trajectories:
+            fallback = self._generate_single_trajectory(1)
+            trajectories = self._randomize_trajectory_lifetimes([fallback]) if fallback else []
+        meas, assoc = self._make_measurements(trajectories)
+        return trajectories, meas, assoc
 
     def _make_measurements(self, trajectories):
         """统一的测量生成逻辑（球坐标加噪→xyz，含杂波）"""

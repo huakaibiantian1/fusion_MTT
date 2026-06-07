@@ -21,7 +21,6 @@ from data_generation import create_dataloaders
 from metrics import TrackingMetrics
 from config import load_config
 
-# 🔥 导入带交叉场景的数据生成器
 try:
     from data_generation_with_crossing import create_dataloaders_with_crossing
     CROSSING_AVAILABLE = True
@@ -29,7 +28,6 @@ except ImportError:
     CROSSING_AVAILABLE = False
     print("⚠️ Warning: data_generation_with_crossing not found, using standard data generation")
 
-# 🔥 导入多场景数据生成器
 try:
     from data_generation_multi_scenario import (
         create_dataloaders_multi_scenario, SCENARIO_TYPES, create_pertype_val_loaders
@@ -44,11 +42,9 @@ def parse_args():
     """解析命令行参数（仅保留必要参数）"""
     parser = argparse.ArgumentParser(description='Train BAIT model')
     
-    # 配置文件路径
     parser.add_argument('--config', type=str, default='config_example.json',
                         help='Path to config file')
     
-    # 运行时参数
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use (cuda or cpu)')
     parser.add_argument('--seed', type=int, default=42,
@@ -56,13 +52,11 @@ def parse_args():
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     
-    # 交叉数据参数
     parser.add_argument('--use-crossing', action='store_true',
                         help='Use crossing trajectory scenarios in training data')
     parser.add_argument('--crossing-prob', type=float, default=0.5,
                         help='Probability of generating crossing scenarios (0.0-1.0)')
 
-    # 多场景参数（覆盖 --use-crossing）
     parser.add_argument('--use-multi', action='store_true',
                         help='Use multi-scenario training data (crossing / many_targets / high_maneuver / spindle)')
     
@@ -99,33 +93,32 @@ def train_one_step(model, batch, criterion, optimizer, device, grad_clip=1.0):
     """训练一步"""
     model.train()
     
-    # 将数据移到设备
     past_states = batch['past_states'].to(device)
     current_measurements = batch['current_measurements'].to(device)
     gt_associations = batch['gt_associations'].to(device)
     gt_states = batch['gt_states'].to(device)
+    gt_slot_mask = batch.get('gt_slot_mask')
+    if gt_slot_mask is not None:
+        gt_slot_mask = gt_slot_mask.to(device)
     num_past_targets = batch['num_past_targets'].to(device)
     num_current_measurements = batch['num_current_measurements'].squeeze(-1).to(device)
     num_current_targets = batch['num_current_targets'].squeeze(-1).to(device)
     
-    # 前向传播
     match_prob_matrix, filtered_states, existence_probs = model(
         past_states, current_measurements, num_past_targets, num_current_measurements
     )
 
-    # 计算损失（传入 existence_probs 以启用存在性 BCE 损失）
     total_loss, loss_dict = criterion(
         match_prob_matrix, filtered_states,
         gt_associations, gt_states,
         num_current_measurements, num_current_targets,
         existence_probs=existence_probs,
+        gt_slot_mask=gt_slot_mask,
     )
 
-    # 反向传播
     optimizer.zero_grad()
     total_loss.backward()
     
-    # 梯度裁剪
     if grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     
@@ -150,26 +143,27 @@ def validate(model, val_loader, criterion, device):
     
     with torch.no_grad():
         for batch in val_loader:
-            # 将数据移到设备
             past_states = batch['past_states'].to(device)
             current_measurements = batch['current_measurements'].to(device)
             gt_associations = batch['gt_associations'].to(device)
             gt_states = batch['gt_states'].to(device)
+            gt_slot_mask = batch.get('gt_slot_mask')
+            if gt_slot_mask is not None:
+                gt_slot_mask = gt_slot_mask.to(device)
             num_past_targets = batch['num_past_targets'].to(device)
             num_current_measurements = batch['num_current_measurements'].squeeze(-1).to(device)
             num_current_targets = batch['num_current_targets'].squeeze(-1).to(device)
             
-            # 前向传播
             match_prob_matrix, filtered_states, existence_probs = model(
                 past_states, current_measurements, num_past_targets, num_current_measurements
             )
 
-            # 计算损失（传入 existence_probs 以启用存在性 BCE 损失）
             _, loss_dict = criterion(
                 match_prob_matrix, filtered_states,
                 gt_associations, gt_states,
                 num_current_measurements, num_current_targets,
                 existence_probs=existence_probs,
+                gt_slot_mask=gt_slot_mask,
             )
 
             total_loss             += loss_dict['total_loss']
@@ -180,11 +174,9 @@ def validate(model, val_loader, criterion, device):
             total_pos_error_m      += loss_dict['pos_error_m']
             num_batches += 1
             
-            # 计算OSPA指标
             batch_size = filtered_states.size(0)
             for i in range(batch_size):
                 num_targets = num_current_targets[i].item()
-                # 提取有效的预测和真实状态
                 pred_states = filtered_states[i, :num_targets].cpu().numpy()
                 true_states = gt_states[i, :num_targets].cpu().numpy()
                 
@@ -217,27 +209,21 @@ def validate(model, val_loader, criterion, device):
 def main():
     args = parse_args()
     
-    # 加载配置
     config = load_config(args.config)
     print(f"\n使用配置文件: {args.config}")
     print(f"配置内容:\n{json.dumps(config.to_dict(), indent=2, ensure_ascii=False)}\n")
     
-    # 设置随机种子
     set_seed(args.seed)
     
-    # 设置设备
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
     
-    # 从config获取参数
     save_dir = config.get('logging', 'save_dir', default='checkpoints')
     log_dir = config.get('logging', 'log_dir', default='logs')
     
-    # 创建保存目录
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
-    # 日志同时写入 txt 文件
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_txt    = os.path.join(log_dir, f'train_log_{timestamp}.txt')
     tee_logger = TeeLogger(log_txt)
@@ -246,7 +232,6 @@ def main():
     config_save_path = os.path.join(save_dir, f'config_{timestamp}.json')
     config.save_config(config_save_path)
     
-    # 创建数据加载器
     print("创建数据加载器...")
 
     _common_loader_kwargs = dict(
@@ -262,7 +247,6 @@ def main():
         crossing_probability=config.get('data', 'crossing_probability', default=0.7),
     )
 
-    # 🔥 多场景模式（crossing / many_targets / high_maneuver / spindle）
     if args.use_multi and MULTI_AVAILABLE:
         print(f"\n{'='*60}")
         print("使用多场景训练数据（4 种类型等量混合）")
@@ -273,7 +257,6 @@ def main():
             test_scenarios_by_type, train_scenarios_by_type, val_scenarios_by_type = \
             create_dataloaders_multi_scenario(**_common_loader_kwargs)
 
-        # 按场景类型创建独立验证 loader（用于分类型统计指标）
         _pertype_kwargs = dict(
             tau=_common_loader_kwargs['tau'],
             max_targets=_common_loader_kwargs['max_targets'],
@@ -284,21 +267,18 @@ def main():
         )
         pertype_val_loaders = create_pertype_val_loaders(val_scenarios_by_type, **_pertype_kwargs)
 
-        # 保存各类型测试集 pkl
         for stype, scenarios in test_scenarios_by_type.items():
             pkl_path = os.path.join(save_dir, f'test_scenarios_{stype}.pkl')
             with open(pkl_path, 'wb') as _f:
                 pickle.dump(scenarios, _f)
             print(f"测试集 '{stype}' 已保存 → {pkl_path}（{len(scenarios)} 条）")
 
-        # 保存各类型验证集 pkl（seed=142，用于训练后评估）
         for stype, scenarios in val_scenarios_by_type.items():
             pkl_path = os.path.join(save_dir, f'val_scenarios_{stype}.pkl')
             with open(pkl_path, 'wb') as _f:
                 pickle.dump(scenarios, _f)
             print(f"验证集 '{stype}' 已保存 → {pkl_path}（{len(scenarios)} 条）")
 
-        # 保存各类型训练集 pkl（用于数据泄露验证，确认模型是否拟合训练数据）
         for stype, scenarios in train_scenarios_by_type.items():
             pkl_path = os.path.join(save_dir, f'train_scenarios_{stype}.pkl')
             with open(pkl_path, 'wb') as _f:
@@ -348,7 +328,6 @@ def main():
     print(f"验证批次数: {len(val_loader)}")
     print(f"测试批次数: {len(test_loader)}")
     
-    # 创建模型
     print("创建模型...")
     model = BAIT(
         d_model=config.get('model', 'd_model', default=256),
@@ -370,7 +349,6 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"可训练参数数量: {num_params:,}")
     
-    # 创建损失函数
     criterion = BAITLoss(
         gamma=config.get('training', 'gamma', default=1.0),
         association_weight=config.get('training', 'association_weight', default=1.0),
@@ -378,14 +356,12 @@ def main():
         existence_weight=config.get('training', 'existence_weight', default=0.5),
     )
     
-    # 创建优化器
     optimizer = optim.Adam(
         model.parameters(),
         lr=config.get('training', 'lr', default=1e-4),
         weight_decay=config.get('training', 'weight_decay', default=1e-5)
     )
     
-    # 学习率调度器
     lr_scheduler_config = config.get('training', 'lr_scheduler', default={'type': 'step', 'step_size': 200000, 'gamma': 0.5})
     if lr_scheduler_config.get('type') == 'step':
         scheduler = optim.lr_scheduler.StepLR(
@@ -396,10 +372,8 @@ def main():
     else:
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200000, gamma=0.5)
     
-    # TensorBoard
     writer = SummaryWriter(os.path.join(log_dir, f'run_{timestamp}'))
     
-    # 恢复训练
     start_step = 0
     if args.resume is not None and os.path.exists(args.resume):
         print(f"从检查点恢复训练: {args.resume}")
@@ -410,14 +384,12 @@ def main():
         start_step = checkpoint['step'] + 1
         print(f"从步骤 {start_step} 恢复")
     
-    # 获取训练参数
     num_steps = config.get('training', 'num_steps', default=800000)
     grad_clip = config.get('training', 'grad_clip', default=1.0)
     log_interval = config.get('logging', 'log_interval', default=100)
     val_interval = config.get('logging', 'val_interval', default=5000)
     save_interval = config.get('logging', 'save_interval', default=10000)
     
-    # 训练循环
     print("\n开始训练...")
     step = start_step
     epoch = 0
@@ -428,7 +400,6 @@ def main():
     while step < num_steps:
         epoch_start_time = time.time()
         
-        # 获取批次
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -436,13 +407,10 @@ def main():
             train_iter = iter(train_loader)
             batch = next(train_iter)
         
-        # 训练一步
         loss_dict = train_one_step(model, batch, criterion, optimizer, device, grad_clip)
         
-        # 更新学习率
         scheduler.step()
         
-        # 记录日志
         if step % log_interval == 0:
             elapsed = time.time() - epoch_start_time
             print(f"步骤 {step}/{num_steps} | "
@@ -462,7 +430,6 @@ def main():
             writer.add_scalar('train/pos_error_m',      loss_dict['pos_error_m'],      step)
             writer.add_scalar('train/lr',               optimizer.param_groups[0]['lr'], step)
         
-        # 验证
         if step % val_interval == 0:
             print("\n验证中...")
             val_stats = validate(model, val_loader, criterion, device)
@@ -484,7 +451,6 @@ def main():
             writer.add_scalar('val/ospa_loc_mean',    val_stats['ospa_loc_mean'],    step)
             writer.add_scalar('val/ospa_card_mean',   val_stats['ospa_card_mean'],   step)
 
-            # 按场景类型分别统计关联准确率
             if pertype_val_loaders:
                 type_accs = {}
                 for stype, pt_loader in pertype_val_loaders.items():
@@ -499,7 +465,6 @@ def main():
                 )
                 print(f"  分场景关联准确率 → {acc_str}")
             
-            # 保存最佳模型
             if val_stats['ospa_mean'] < best_val_ospa:
                 best_val_ospa = val_stats['ospa_mean']
                 save_path = os.path.join(save_dir, 'best_model.pth')
@@ -512,7 +477,6 @@ def main():
                 }, save_path)
                 print(f"保存最佳模型，OSPA: {best_val_ospa:.4f}")
         
-        # 定期保存
         if step % save_interval == 0 and step > 0:
             save_path = os.path.join(save_dir, f'checkpoint_step_{step}.pth')
             torch.save({
@@ -525,7 +489,6 @@ def main():
         
         step += 1
     
-    # 最终保存
     save_path = os.path.join(save_dir, 'final_model.pth')
     torch.save({
         'step': step,
@@ -535,7 +498,6 @@ def main():
     }, save_path)
     print(f"\n训练完成！最终模型已保存到 {save_path}")
     
-    # 在测试集上评估
     print("\n在测试集上评估...")
     test_stats = validate(model, test_loader, criterion, device)
     print(f"测试 - 总损失: {test_stats['loss']:.4f} | "

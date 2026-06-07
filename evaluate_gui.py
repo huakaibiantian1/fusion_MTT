@@ -37,6 +37,8 @@ from bait_model import BAIT
 from data_generation_multi_scenario import MTTDataGeneratorMultiScenario
 from evaluate_3d import (
     evaluate_scenario,
+    evaluate_scenario_oracle_slots,
+    evaluate_scenario_phd_managed,
     plot_3d_trajectories,
     plot_error_curves,
     plot_ospa_curve,
@@ -120,9 +122,16 @@ class EvaluateGUI:
         algo_frame.pack(fill='x', **pad)
 
         self._algo_var = tk.StringVar(value='BAIT')
-        for algo in ('BAIT', 'MHT', 'PHD', 'JPDA'):
+        algo_labels = {
+            'BAIT': 'BAIT(GT)',
+            'PHD+BAIT': 'PHD+BAIT',
+            'MHT': 'MHT',
+            'PHD': 'PHD',
+            'JPDA': 'JPDA',
+        }
+        for algo, label in algo_labels.items():
             ttk.Radiobutton(
-                algo_frame, text=algo, variable=self._algo_var,
+                algo_frame, text=label, variable=self._algo_var,
                 value=algo, command=self._on_algo_change,
             ).pack(side='left', padx=12)
 
@@ -322,6 +331,9 @@ class EvaluateGUI:
             w.pack_forget()
         if algo == 'BAIT':
             self._bait_frame.pack(fill='x', padx=10, pady=4)
+        elif algo == 'PHD+BAIT':
+            self._bait_frame.pack(fill='x', padx=10, pady=4)
+            self._phd_frame.pack(fill='x', padx=10, pady=4)
         elif algo == 'MHT':
             self._mht_frame.pack(fill='x', padx=10, pady=4)
         elif algo == 'PHD':
@@ -381,7 +393,7 @@ class EvaluateGUI:
             extra['spindle_crossing'] = (None if cv == 'random' else cv == 'yes')
 
         # BAIT 需要检查点文件
-        if algo == 'BAIT':
+        if algo in ('BAIT', 'PHD+BAIT'):
             ckpt = self._ckpt_var.get().strip()
             if not os.path.isfile(ckpt):
                 messagebox.showerror('文件不存在', f'找不到检查点文件：\n{ckpt}')
@@ -407,7 +419,7 @@ class EvaluateGUI:
                 max_hypotheses = self._mht_max_hyp.get(),
                 use_gt_init  = self._mht_gt_init.get(),
             )
-        elif algo == 'PHD':
+        elif algo in ('PHD', 'PHD+BAIT'):
             algo_params = dict(
                 sigma_r      = self._phd_sigma_r.get(),
                 sigma_q      = self._phd_sigma_q.get(),
@@ -417,8 +429,9 @@ class EvaluateGUI:
                 birth_weight = self._phd_birth_w.get(),
                 prune_thresh = self._phd_prune.get(),
                 merge_dist   = self._phd_merge.get(),
-                use_gt_init  = self._phd_gt_init.get(),
             )
+            if algo == 'PHD':
+                algo_params['use_gt_init'] = self._phd_gt_init.get()
         elif algo == 'JPDA':
             algo_params = dict(
                 sigma_r      = self._jpda_sigma_r.get(),
@@ -470,10 +483,17 @@ class EvaluateGUI:
             )
             scenario = gen.generate_by_type(scene_type)
             print(f'场景生成完毕，目标数: {len(scenario[0])}，帧数: {len(scenario[1])}')
+            print('轨迹生命周期:')
+            for tr in scenario[0]:
+                b = int(tr.get('birth_frame', 0))
+                d = int(tr.get('death_frame', len(tr.get('states', [])) - 1))
+                print(f"  traj{int(tr['label']):2d}: birth={b:2d}, death={d:2d}, len={d - b + 1:2d}")
 
             # ── 运行算法 ──────────────────────────────────────
             if algo == 'BAIT':
                 result = self._run_bait(ckpt_path, scenario)
+            elif algo == 'PHD+BAIT':
+                result = self._run_bait(ckpt_path, scenario, phd_managed=True, phd_params=algo_params)
             elif algo == 'MHT':
                 result = evaluate_scenario_mht(copy.deepcopy(scenario), **algo_params)
             elif algo == 'PHD':
@@ -500,27 +520,49 @@ class EvaluateGUI:
             # ── 统计 ──────────────────────────────────────────
             avg_acc  = float(np.mean(result['frame_assoc_acc']))
             all_dist = []
+            missed_targets = 0
+            total_targets = 0
             for fi in range(len(result['frame_pred_xyz'])):
                 pred = result['frame_pred_xyz'][fi]
                 true = result['frame_true_xyz'][fi]
-                n    = min(len(pred), len(true))
+                total_targets += len(true)
+                n = min(len(pred), len(true))
+                if len(true) > len(pred):
+                    missed_targets += len(true) - len(pred)
                 if n > 0:
                     diffs = (pred[:n] - true[:n]) * COORD_SCALE
-                    for d in np.linalg.norm(diffs, axis=1):
-                        if not np.isnan(d):
+                    dists = np.linalg.norm(diffs, axis=1)
+                    for d in dists:
+                        if np.isnan(d):
+                            missed_targets += 1
+                        else:
                             all_dist.append(float(d))
             avg_dist = float(np.mean(all_dist)) if all_dist else 0.0
+            miss_rate = float(missed_targets / total_targets) if total_targets > 0 else 0.0
 
             summary = {
                 'algo':     algo,
                 'avg_acc':  avg_acc,
                 'avg_ospa': avg_ospa,
                 'avg_dist': avg_dist,
+                'miss_rate': miss_rate,
+                'diagnostics': result.get('diagnostics', {}),
                 'n_traj':   len(scenario[0]),
             }
             print(f'\n[{algo}] 关联正确率: {avg_acc*100:.1f}%  '
                   f'OSPA: {avg_ospa:.2f}m  '
-                  f'平均3D误差: {avg_dist:.2f}m')
+                  f'命中3D误差: {avg_dist:.2f}m  '
+                  f'漏失率: {miss_rate*100:.1f}%')
+            if summary['diagnostics']:
+                d = summary['diagnostics']
+                print(
+                    '[分层诊断] '
+                    f"PHD确认覆盖率={d.get('phd_confirm_recall', 0.0)*100:.1f}% | "
+                    f"PHD虚警确认={d.get('phd_false_confirmed', 0)} | "
+                    f"PHD确认位置误差={d.get('phd_mean_pos_error_m', float('nan')):.1f}m | "
+                    f"BAIT条件关联={d.get('bait_assoc_on_confirmed', 0.0)*100:.1f}% | "
+                    f"BAIT预测误差={d.get('bait_mean_pred_error_m', float('nan')):.1f}m"
+                )
 
         except Exception as e:
             import traceback
@@ -536,7 +578,7 @@ class EvaluateGUI:
             'error':      error_msg,
         })
 
-    def _run_bait(self, ckpt_path: str, scenario):
+    def _run_bait(self, ckpt_path: str, scenario, phd_managed=False, phd_params=None):
         """加载 BAIT 模型并运行评估。"""
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f'设备: {device}')
@@ -549,7 +591,17 @@ class EvaluateGUI:
 
         eval_max_measurements = max(
             30, max((len(m) for m in scenario[1]), default=0))
-        return evaluate_scenario(
+        if phd_managed:
+            return evaluate_scenario_phd_managed(
+                model, copy.deepcopy(scenario),
+                tau=4, max_targets=20,
+                max_measurements=eval_max_measurements,
+                device=device, scenario_idx=0,
+                phd_params=phd_params,
+            )
+
+        print('BAIT(GT): using ground-truth lifecycle, non-reuse slots, and GT-filled past states.')
+        return evaluate_scenario_oracle_slots(
             model, copy.deepcopy(scenario),
             tau=4, max_targets=20,
             max_measurements=eval_max_measurements,
@@ -572,9 +624,17 @@ class EvaluateGUI:
                 self._summary_var.set(
                     f"[{s['algo']}]  关联正确率: {s['avg_acc']*100:.1f}%    "
                     f"OSPA: {s['avg_ospa']:.2f} m    "
-                    f"平均3D误差: {s['avg_dist']:.2f} m    "
+                    f"命中3D误差: {s['avg_dist']:.2f} m    "
+                    f"漏失率: {s.get('miss_rate', 0.0)*100:.1f}%    "
                     f"目标数: {s['n_traj']}"
                 )
+                if s.get('diagnostics'):
+                    d = s['diagnostics']
+                    self._summary_var.set(
+                        self._summary_var.get()
+                        + f"    PHD覆盖: {d.get('phd_confirm_recall', 0.0)*100:.1f}%"
+                        + f"    BAIT条件关联: {d.get('bait_assoc_on_confirmed', 0.0)*100:.1f}%"
+                    )
                 if res['plot_paths']:
                     self._show_plots(res['plot_paths'])
         else:

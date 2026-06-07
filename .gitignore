@@ -3,7 +3,12 @@ logs_multi/
 checkpoints/
 checkpoints_1/
 checkpoints_2/
-
+checkpoints_multi/  
+checkpoints_multi_1/  
+checkpoints_multi_2/
+checkpoints_multi_3/
+checkpoints_v3/
+checkpoints_v4/
 checkpoints_radar_crossing/
 checkpoints_star_crossing/
 logs_radar_crossing/

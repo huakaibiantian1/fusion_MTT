@@ -26,9 +26,6 @@ import torch.nn.functional as F
 import math
 
 
-# ============================================================
-# 位置编码
-# ============================================================
 
 class PositionalEncoding(nn.Module):
     """正弦位置编码"""
@@ -49,9 +46,6 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1), :]
 
 
-# ============================================================
-# 创新 1 核心：双向交叉注意力桥
-# ============================================================
 
 class CrossBridge(nn.Module):
     """
@@ -66,7 +60,6 @@ class CrossBridge(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=1024, dropout=0.1):
         super().__init__()
 
-        # ── Track 流关注 Meas ──────────────────────────────────────
         self.track_cross_attn = nn.MultiheadAttention(
             d_model, nhead, dropout=dropout, batch_first=True
         )
@@ -80,7 +73,6 @@ class CrossBridge(nn.Module):
         )
         self.track_norm2 = nn.LayerNorm(d_model)
 
-        # ── Meas 流关注 Track ──────────────────────────────────────
         self.meas_cross_attn = nn.MultiheadAttention(
             d_model, nhead, dropout=dropout, batch_first=True
         )
@@ -104,7 +96,6 @@ class CrossBridge(nn.Module):
             enhanced_track: [B, tau*max_T, D]
             enhanced_meas:  [B, M, D]
         """
-        # Track 关注 Meas（key/value 为测量，掩蔽 padding 列）
         t_ctx, _ = self.track_cross_attn(
             query=track_feats,
             key=meas_feats,
@@ -114,7 +105,6 @@ class CrossBridge(nn.Module):
         track_feats = self.track_norm1(track_feats + t_ctx)
         track_feats = self.track_norm2(track_feats + self.track_ffn(track_feats))
 
-        # Meas 关注 Track（所有轨迹槽均有效，无需掩蔽）
         m_ctx, _ = self.meas_cross_attn(
             query=meas_feats,
             key=track_feats,
@@ -126,9 +116,6 @@ class CrossBridge(nn.Module):
         return track_feats, meas_feats
 
 
-# ============================================================
-# BAIT v2 主体
-# ============================================================
 
 class BAIT(nn.Module):
     """
@@ -182,15 +169,10 @@ class BAIT(nn.Module):
         self.sinkhorn_iters   = sinkhorn_iters
         self.coord_scale      = 50000.0  # 坐标归一化因子
 
-        # ─── 公共嵌入层 ───────────────────────────────────────────────
         self.state_embedding       = nn.Linear(state_dim, d_model)
         self.measurement_embedding = nn.Linear(measurement_dim, d_model)
         self.pos_encoder           = PositionalEncoding(d_model)
 
-        # ─── 创新 1：Dual-Stream 双流并行架构 ────────────────────────
-        #
-        # Stream A: Track Encoder
-        #   处理 tau 帧历史轨迹状态，捕获目标运动规律
         _track_enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward_encoder,
@@ -200,8 +182,6 @@ class BAIT(nn.Module):
             _track_enc_layer, num_layers=num_encoder_layers
         )
 
-        # Stream B: Measurement Encoder（独立，轻量）
-        #   对当前帧所有测量做 self-attention，捕获测量间的空间结构
         _meas_enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward_meas_encoder,
@@ -211,16 +191,12 @@ class BAIT(nn.Module):
             _meas_enc_layer, num_layers=num_meas_encoder_layers
         )
 
-        # Cross-Bridge: 双向交叉注意力（让两流在关联前互相感知）
         self.cross_bridge = CrossBridge(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward_bridge,
             dropout=dropout,
         )
 
-        # ─── Associate Decoder ───────────────────────────────────────
-        # query  = 增强测量特征（融合了轨迹上下文）
-        # memory = 增强轨迹特征（融合了测量上下文）
         _assoc_layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward_associate,
@@ -229,21 +205,12 @@ class BAIT(nn.Module):
         self.associate_decoder = nn.TransformerDecoder(
             _assoc_layer, num_layers=num_associate_decoder_layers
         )
-        # MPM 输出：每个测量对应 max_targets+1 个概率（含 clutter）
         self.match_prob_head = nn.Linear(d_model, max_targets + 1)
 
-        # ─── 创新 3：Sinkhorn 可微关联 ───────────────────────────────
-        # 可学习温度参数：控制软/硬分配程度（初始 exp(0)=1.0）
         self.log_sinkhorn_temp = nn.Parameter(torch.zeros(1))
 
-        # ─── 创新 2：Track Query 动态轨迹槽 ─────────────────────────
-        # 每个槽携带可学习的先验嵌入，主动感知对应目标
-        # 不同槽的初始化有差异，避免退化为相同表示
         self.track_queries = nn.Embedding(max_targets, d_model)
 
-        # ─── Filtering Decoder ───────────────────────────────────────
-        # query  = Track Query + Sinkhorn 加权测量嵌入（槽位先验 + 当前观测）
-        # memory = 增强轨迹特征（与 Associate Decoder 共享）
         _filt_layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_feedforward_filtering,
@@ -253,11 +220,8 @@ class BAIT(nn.Module):
             _filt_layer, num_layers=num_filtering_decoder_layers
         )
 
-        # 位置修正头：输出修正量（残差连接到 Sinkhorn 加权测量位置）
         self.state_output_head = nn.Linear(d_model, 3)
 
-        # 存在性预测头：由 Filtering Decoder 完整上下文驱动
-        # 取代原来仅用 max 概率的简单做法
         self.existence_head = nn.Sequential(
             nn.Linear(d_model, 64),
             nn.ReLU(),
@@ -275,14 +239,11 @@ class BAIT(nn.Module):
             elif 'bias' in name:
                 nn.init.zeros_(p)
 
-        # state_output_head: 学习修正量，初始接近 0 保证早期训练稳定
         nn.init.xavier_uniform_(self.state_output_head.weight, gain=0.01)
         nn.init.zeros_(self.state_output_head.bias)
 
-        # Track Queries: 正态分布初始化，各槽有差异
         nn.init.normal_(self.track_queries.weight, mean=0.0, std=0.02)
 
-        # Sinkhorn 温度：初始 exp(0)=1.0
         nn.init.zeros_(self.log_sinkhorn_temp)
 
     def forward(self, past_states, current_measurements,
@@ -304,22 +265,16 @@ class BAIT(nn.Module):
         B     = past_states.size(0)
         max_M = current_measurements.size(1)
 
-        # 测量 padding mask：True = 无效 padding 位置（应被注意力忽略）
         meas_pad_mask = (
             torch.arange(max_M, device=current_measurements.device).unsqueeze(0)
             >= num_current_measurements.unsqueeze(1)
         )  # [B, max_M]
 
-        # ════════════════════════════════════════════════════
-        # 创新 1：Dual-Stream + Cross-Bridge
-        # ════════════════════════════════════════════════════
 
-        # ── Track Stream ──────────────────────────────────────────────
         track_emb = self.state_embedding(past_states)    # [B, tau*T, D]
         track_emb = self.pos_encoder(track_emb)
         track_feats = self.track_encoder(track_emb)      # [B, tau*T, D]
 
-        # ── Measurement Stream（独立编码）────────────────────────────
         meas_emb = self.measurement_embedding(current_measurements)  # [B, M, D]
         meas_emb = self.pos_encoder(meas_emb)
         meas_feats = self.meas_encoder(
@@ -327,20 +282,12 @@ class BAIT(nn.Module):
             src_key_padding_mask=meas_pad_mask,
         )  # [B, M, D]
 
-        # ── Cross-Bridge（双向交叉注意力，两流互相感知）──────────────
         track_feats, meas_feats = self.cross_bridge(
             track_feats, meas_feats,
             meas_key_padding_mask=meas_pad_mask,
         )
-        # track_feats: [B, tau*T, D]  已融入当前测量上下文
-        # meas_feats:  [B, M, D]      已融入历史轨迹上下文
 
-        # ════════════════════════════════════════════════════
-        # Associate Decoder → Match Prob Matrix
-        # ════════════════════════════════════════════════════
 
-        # query = 增强测量（"我属于哪条轨迹？"）
-        # memory = 增强轨迹（"历史轨迹预测"）
         assoc_out = self.associate_decoder(
             meas_feats,     # query
             track_feats,    # memory
@@ -349,31 +296,18 @@ class BAIT(nn.Module):
         match_prob_matrix = self.match_prob_head(assoc_out)   # [B, M, T+1]
         match_prob_matrix_norm = F.softmax(match_prob_matrix, dim=-1)
 
-        # ════════════════════════════════════════════════════
-        # 创新 3：Sinkhorn 可微最优传输关联
-        # ════════════════════════════════════════════════════
 
         filtering_queries, soft_assignment = self._sinkhorn_assign(
             match_prob_matrix_norm,
             current_measurements,
             num_current_measurements,
         )
-        # filtering_queries: [B, T, 3]  软赋值加权后的测量位置
-        # soft_assignment:   [B, M, T]  软赋值矩阵（训练可微）
 
-        # ════════════════════════════════════════════════════
-        # 创新 2：Track Query 驱动的 Filtering Decoder
-        # ════════════════════════════════════════════════════
 
-        # 可学习 Track Query 槽位先验 [B, T, D]
         track_q = self.track_queries.weight.unsqueeze(0).expand(B, -1, -1)
 
-        # Sinkhorn 加权测量编码：将软赋值后的测量位置映射到特征空间
         weighted_meas_emb = self.measurement_embedding(filtering_queries)  # [B, T, D]
 
-        # Filtering Decoder 输入 = 槽位先验 + 软赋值观测信息
-        # Track Query  → 携带"这个槽在哪里寻找目标"的先验
-        # weighted_meas_emb → 携带"当前帧哪个测量最可能属于我"的信息
         filt_input = self.pos_encoder(track_q + weighted_meas_emb)  # [B, T, D]
 
         filt_out = self.filtering_decoder(
@@ -381,18 +315,13 @@ class BAIT(nn.Module):
             track_feats,    # memory: 增强的历史轨迹特征（含测量上下文）
         )  # [B, T, D]
 
-        # 位置输出：Sinkhorn 加权测量位置 + Decoder 学到的修正量（残差）
         state_correction = self.state_output_head(filt_out)    # [B, T, 3]
         filtered_states  = filtering_queries + state_correction  # [B, T, 3]
 
-        # 存在性预测：由 Filtering Decoder 完整上下文驱动（比 max 概率更可靠）
         existence_probs = self.existence_head(filt_out).squeeze(-1)  # [B, T]
 
         return match_prob_matrix_norm, filtered_states, existence_probs
 
-    # ------------------------------------------------------------------
-    # 创新 3 核心：Sinkhorn 最优传输软赋值
-    # ------------------------------------------------------------------
 
     def _sinkhorn_assign(self, match_prob_matrix, measurements, num_measurements):
         """
@@ -419,48 +348,34 @@ class BAIT(nn.Module):
         B, M, T_plus1 = match_prob_matrix.shape
         T = T_plus1 - 1
 
-        # 取轨迹列（排除 clutter 列 0），转 log 空间
         log_p = torch.log(match_prob_matrix[:, :, 1:].clamp(min=1e-8))  # [B, M, T]
 
-        # 可学习温度：高温→软（uniform），低温→硬（argmax）
         temperature = self.log_sinkhorn_temp.exp().clamp(min=0.02, max=2.0)
         log_p = log_p / temperature
 
-        # 构造 padding 掩码（True = 无效测量，置为 -1e9 不参与归一化）
         pad_mask = (
             torch.arange(M, device=measurements.device).unsqueeze(0)
             >= num_measurements.unsqueeze(1)
         )  # [B, M]
         log_p = log_p.masked_fill(pad_mask.unsqueeze(-1), -1e9)
 
-        # ── Sinkhorn-Knopp 迭代 ────────────────────────────────────────
-        # 奇数步：行归一化（每个测量在 T 条轨迹上的概率和 → 1）
-        # 偶数步：列归一化（每条轨迹被各测量赋值的概率和 → 1）
-        # padding 行在每步后重置为 -1e9，避免污染后续归一化
         for _ in range(self.sinkhorn_iters):
-            # 行归一化（dim=2：在轨迹维度 T 上归一化）
             log_p = log_p - torch.logsumexp(log_p, dim=2, keepdim=True)
             log_p = log_p.masked_fill(pad_mask.unsqueeze(-1), -1e9)
 
-            # 列归一化（dim=1：在测量维度 M 上归一化，padding 行贡献 ≈ 0）
             log_p = log_p - torch.logsumexp(log_p, dim=1, keepdim=True)
             log_p = log_p.masked_fill(pad_mask.unsqueeze(-1), -1e9)
 
         soft_P = torch.exp(log_p)  # [B, M, T]  软赋值矩阵（padding 行 ≈ 0）
 
-        # 对每条轨迹，按软赋值权重对有效测量做加权平均 → 得到该轨迹的"软赋值位置"
         col_sum  = soft_P.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [B, 1, T]
         soft_P_n = soft_P / col_sum                                   # [B, M, T] 列归一化
 
-        # filtering_queries[b, t, :] = Σ_m soft_P_n[b,m,t] × measurements[b,m,:]
         filtering_queries = torch.einsum('bmt,bmd->btd', soft_P_n, measurements)  # [B, T, 3]
 
         return filtering_queries, soft_P
 
 
-# ============================================================
-# 损失函数
-# ============================================================
 
 class BAITLoss(nn.Module):
     """
@@ -493,7 +408,8 @@ class BAITLoss(nn.Module):
         gt_states,
         num_measurements,
         num_targets,
-        existence_probs=None,   # v2 新增（可选，None 时跳过存在性损失）
+        existence_probs=None,
+        gt_slot_mask=None,
     ):
         """
         Args:
@@ -508,20 +424,19 @@ class BAITLoss(nn.Module):
         Returns:
             total_loss, loss_dict
         """
-        # 1. Association Loss
         association_loss = self._association_loss(
             match_prob_matrix, gt_associations, num_measurements
         )
 
-        # 2. Filtering Loss
         filtering_loss = self._filtering_loss(
-            filtered_states, gt_states, num_targets
+            filtered_states, gt_states, num_targets, gt_slot_mask=gt_slot_mask
         )
 
-        # 3. Existence Loss（v2 新增，presence 有 existence_probs 时启用）
         existence_loss = torch.tensor(0.0, device=filtered_states.device)
         if existence_probs is not None:
-            existence_loss = self._existence_loss(existence_probs, num_targets)
+            existence_loss = self._existence_loss(
+                existence_probs, num_targets, gt_slot_mask=gt_slot_mask
+            )
 
         total_loss = (
             self.association_weight * association_loss
@@ -529,13 +444,13 @@ class BAITLoss(nn.Module):
             + self.existence_weight   * existence_loss
         )
 
-        # ── 可解释指标（不参与梯度）──────────────────────────────────
         with torch.no_grad():
             max_meas = match_prob_matrix.size(1)
             meas_mask = (
                 torch.arange(max_meas, device=match_prob_matrix.device).unsqueeze(0)
                 < num_measurements.unsqueeze(1)
             )
+            meas_mask = meas_mask & (gt_associations >= 0)
             pred_assoc = match_prob_matrix.argmax(dim=-1)
             correct = (pred_assoc == gt_associations.long()) & meas_mask
             association_acc = (
@@ -544,10 +459,13 @@ class BAITLoss(nn.Module):
 
             coord_scale = 50000.0
             max_targets = filtered_states.size(1)
-            tgt_mask = (
-                torch.arange(max_targets, device=filtered_states.device).unsqueeze(0)
-                < num_targets.unsqueeze(1)
-            )
+            if gt_slot_mask is not None:
+                tgt_mask = gt_slot_mask.to(filtered_states.device).bool()
+            else:
+                tgt_mask = (
+                    torch.arange(max_targets, device=filtered_states.device).unsqueeze(0)
+                    < num_targets.unsqueeze(1)
+                )
             pos_error = torch.norm(
                 (filtered_states - gt_states) * coord_scale, dim=-1
             )
@@ -576,12 +494,12 @@ class BAITLoss(nn.Module):
         max_meas        = match_prob_matrix.size(1)
         max_T_plus1     = match_prob_matrix.size(2)
 
-        gt_associations = torch.clamp(gt_associations, 0, max_T_plus1 - 1)
-
         mask = (
             torch.arange(max_meas, device=match_prob_matrix.device).unsqueeze(0)
             < num_measurements.unsqueeze(1)
         )
+        mask = mask & (gt_associations >= 0)
+        gt_associations = torch.clamp(gt_associations, 0, max_T_plus1 - 1)
 
         b_idx = torch.arange(batch_size, device=match_prob_matrix.device).unsqueeze(1).expand(-1, max_meas)
         m_idx = torch.arange(max_meas,   device=match_prob_matrix.device).unsqueeze(0).expand(batch_size, -1)
@@ -598,7 +516,7 @@ class BAITLoss(nn.Module):
 
         return ce_loss + dice_loss
 
-    def _filtering_loss(self, filtered_states, gt_states, num_targets):
+    def _filtering_loss(self, filtered_states, gt_states, num_targets, gt_slot_mask=None):
         """
         滤波损失 = MSE（米空间）
 
@@ -612,14 +530,17 @@ class BAITLoss(nn.Module):
         diff = (filtered_states - gt_states) * coord_scale
         loss = (diff ** 2).sum(dim=-1)  # [B, T]  L2² per target
 
-        mask = (
-            torch.arange(max_targets, device=filtered_states.device).unsqueeze(0)
-            < num_targets.unsqueeze(1)
-        )
-        loss = (loss * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+        if gt_slot_mask is not None:
+            mask = gt_slot_mask.to(filtered_states.device).float()
+        else:
+            mask = (
+                torch.arange(max_targets, device=filtered_states.device).unsqueeze(0)
+                < num_targets.unsqueeze(1)
+            ).float()
+        loss = (loss * mask).sum() / mask.sum().clamp(min=1.0)
         return loss / 1e9
 
-    def _existence_loss(self, existence_probs, num_targets):
+    def _existence_loss(self, existence_probs, num_targets, gt_slot_mask=None):
         """
         存在性 BCE 损失（v2 新增）
 
@@ -627,16 +548,16 @@ class BAITLoss(nn.Module):
         训练模型在槽位先验基础上准确预测轨迹是否活跃。
         """
         max_T    = existence_probs.size(1)
-        exist_gt = (
-            torch.arange(max_T, device=existence_probs.device).unsqueeze(0)
-            < num_targets.unsqueeze(1)
-        ).float()
+        if gt_slot_mask is not None:
+            exist_gt = gt_slot_mask.to(existence_probs.device).float()
+        else:
+            exist_gt = (
+                torch.arange(max_T, device=existence_probs.device).unsqueeze(0)
+                < num_targets.unsqueeze(1)
+            ).float()
         return F.binary_cross_entropy(existence_probs, exist_gt, reduction='mean')
 
 
-# ============================================================
-# 快速测试
-# ============================================================
 
 if __name__ == "__main__":
     print("Testing BAIT v2 model...")
@@ -695,7 +616,6 @@ if __name__ == "__main__":
 
     print(f"\nLoss dict: {loss_dict}")
 
-    # 测试梯度流
     total_loss.backward()
     grad_track_q = model.track_queries.weight.grad
     grad_sinkhorn_temp = model.log_sinkhorn_temp.grad

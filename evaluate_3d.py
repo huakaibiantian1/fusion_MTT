@@ -1,4 +1,4 @@
-"""
+﻿"""
 3D BAIT 模型评估脚本
 输出：
   1. 三维轨迹对比图（真实 vs 预测 + 测量点）
@@ -24,13 +24,16 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D   # noqa: F401
 import torch
+from scipy.optimize import linear_sum_assignment
 
 from bait_model import BAIT
+from data_generation import build_non_reuse_slot_schedule
 from data_generation_with_crossing import (
     MTTDataGeneratorWithCrossing,
     MTTDatasetWithCrossing,
 )
 from metrics import TrackingMetrics
+from phd_bait_tracker import PHDBAITTracker
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
@@ -38,9 +41,6 @@ plt.rcParams['axes.unicode_minus'] = False
 COORD_SCALE = 50000.0   # 归一化因子：R_max=50000m，与训练保持一致
 
 
-# ============================================================
-# 命令行参数
-# ============================================================
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -53,16 +53,12 @@ def parse_args():
   val_split   使用训练时的验证集（seed=142），优先加载 checkpoint 目录下的 val_scenarios*.pkl
 
 示例:
-  # 新场景（默认）
   python evaluate_3d.py --checkpoint checkpoints_multi/best_model.pth --scene-source new --num-scenarios 5
 
-  # 训练时的测试集
   python evaluate_3d.py --checkpoint checkpoints_multi/best_model.pth --scene-source test_split --num-scenarios 10
 
-  # 训练时的验证集（推荐用于模型选择）
   python evaluate_3d.py --checkpoint checkpoints_multi/best_model.pth --scene-source val_split --num-scenarios 10
 
-  # 直接指定验证集 pkl（多场景分类型评估）
   python evaluate_3d.py --checkpoint checkpoints_multi/best_model.pth --scenarios-pkl checkpoints_multi/val_scenarios_crossing.pkl
 """
     )
@@ -76,8 +72,9 @@ def parse_args():
     p.add_argument('--task-type',         type=int,   default=1, choices=[1, 2])
     p.add_argument('--device',            type=str,   default='cuda')
     p.add_argument('--output-dir',        type=str,   default='evaluation_results_3d')
+    p.add_argument('--phd-managed', action='store_true',
+                   help='Use PHD estimates to manage BAIT past tracks and slots')
 
-    # ── 场景来源控制 ──────────────────────────────────────────────
     p.add_argument(
         '--scene-source',
         type=str,
@@ -89,14 +86,12 @@ def parse_args():
             'val_split  = 使用训练时的验证集（固定 seed=142，优先加载 val_scenarios*.pkl）'
         )
     )
-    # 仅在 --scene-source new 时生效
     p.add_argument('--seed',              type=int,   default=9999,
                    help='随机种子（仅 --scene-source new 时有效）')
     p.add_argument('--crossing-prob',     type=float, default=0.8,
                    help='交叉场景概率（仅 --scene-source new 时有效）')
     p.add_argument('--star-crossing-prob', type=float, default=0.7,
                    help='星形交叉概率（仅 --scene-source new 时有效）')
-    # 仅在 --scene-source test_split 时生效
     p.add_argument('--test-seed',         type=int,   default=242,
                    help='测试集 seed（仅 --scene-source test_split 时有效，默认与训练一致=242）')
     p.add_argument('--test-crossing-prob', type=float, default=0.5,
@@ -104,7 +99,6 @@ def parse_args():
     p.add_argument('--test-star-prob',     type=float, default=0.7,
                    help='测试集星形交叉概率（仅 --scene-source test_split 时有效）')
 
-    # ── 直接指定 pkl 文件（优先级最高，覆盖 --scene-source）────────
     p.add_argument(
         '--scenarios-pkl',
         type=str,
@@ -120,9 +114,6 @@ def parse_args():
     return p.parse_args()
 
 
-# ============================================================
-# 辅助：准备过去 tau 帧的状态（3D，5维）
-# ============================================================
 
 def prepare_past_states(tracked_states, trajectories, frame_idx, tau, max_targets, dt, T_total=30.0):
     """
@@ -169,9 +160,6 @@ def prepare_measurements(meas_frame, max_measurements):
     return meas
 
 
-# ============================================================
-# 核心评估逻辑（单个场景）
-# ============================================================
 
 def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, device, scenario_idx):
     """
@@ -189,7 +177,6 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
     trajectories, measurements, gt_associations = scenario
     num_frames = len(measurements)
 
-    # —— 归一化 ——
     for traj in trajectories:
         traj['states'][:, :3] /= COORD_SCALE   # xyz 归一化
     for fm in measurements:
@@ -198,14 +185,12 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
 
     print(f"目标数: {len(trajectories)}  帧数: {num_frames}")
 
-    # —— 初始化 tracked_states：前 tau 帧用真实测量初始化 ——
     tracked_states = {traj['label']: [] for traj in trajectories}
 
     for traj in trajectories:
         lbl = traj['label']
         for t in range(tau):
             if traj['birth_frame'] <= t <= traj['death_frame']:
-                # 在该帧找到此目标的测量
                 found = None
                 for i, al in enumerate(gt_associations[t]):
                     if al == lbl and i < len(measurements[t]):
@@ -215,7 +200,6 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
             else:
                 tracked_states[lbl].append(np.zeros(3))
 
-    # —— 逐帧推理 ——
     frame_pred_xyz   = []   # [num_eval_frames][n_active, 3]
     frame_true_xyz   = []
     frame_assoc_acc  = []   # [num_eval_frames] float
@@ -231,7 +215,6 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
             n_meas_raw = len(measurements[frame_idx])
             n_meas     = min(n_meas_raw, max_measurements)
 
-            # 每帧实际目标数
             n_past_per_frame = []
             for t in range(frame_idx - tau, frame_idx):
                 n_past_per_frame.append(
@@ -248,7 +231,6 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
             filtered_np = filtered_states[0].cpu().numpy()   # [max_targets, 3]
             match_np    = match_prob[0].cpu().numpy()         # [max_meas, max_targets+1]
 
-            # ── 关联正确率 ──
             gt_assoc_frame = gt_associations[frame_idx][:n_meas]
             pred_assoc = np.argmax(match_np[:n_meas, 1:], axis=1) + 1  # 排除 clutter 列
             valid = gt_assoc_frame > 0
@@ -269,7 +251,6 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
             frame_assoc_acc.append(acc)
             frame_assoc_detail.append(detail_rows)
 
-            # 控制台打印
             trunc_msg = f"/{n_meas_raw}" if n_meas_raw > n_meas else ""
             print(f"  帧{frame_idx:3d} | 测量总数={n_meas:3d}{trunc_msg} 真实={int(valid.sum()):2d} 杂波={int((~valid).sum()):2d} | 关联正确率={acc*100:.1f}%")
             for row in detail_rows:
@@ -277,7 +258,6 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
                 p = row['pos_real']
                 print(f"          {mark} 测量{row['meas_idx']} ({p[0]:.1f},{p[1]:.1f},{p[2]:.1f})m  预测→轨迹{row['pred_label']}  真实→轨迹{row['gt_label']}")
 
-            # ── 收集预测 / 真实 xyz ──
             pred_xyz_frame = []
             true_xyz_frame = []
             for idx_t, traj in enumerate(trajectories):
@@ -288,7 +268,6 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
             frame_pred_xyz.append(np.array(pred_xyz_frame) if pred_xyz_frame else np.empty((0, 3)))
             frame_true_xyz.append(np.array(true_xyz_frame) if true_xyz_frame else np.empty((0, 3)))
 
-            # ── 更新 tracked_states ──
             for idx_t, traj in enumerate(trajectories):
                 if idx_t < max_targets:
                     tracked_states[traj['label']].append(filtered_np[idx_t].copy())
@@ -307,9 +286,363 @@ def evaluate_scenario(model, scenario, tau, max_targets, max_measurements, devic
     }
 
 
-# ============================================================
-# 绘图函数
-# ============================================================
+def evaluate_scenario_oracle_slots(model, scenario, tau, max_targets, max_measurements, device, scenario_idx):
+    model.eval()
+    print(f"\n{'='*60}")
+    print(f"Scenario {scenario_idx + 1} | BAIT oracle slots")
+    print(f"{'='*60}")
+
+    trajectories, measurements, gt_associations = scenario
+    num_frames = len(measurements)
+
+    for traj in trajectories:
+        traj['states'][:, :3] /= COORD_SCALE
+    for fm in measurements:
+        if len(fm) > 0:
+            fm[:] = fm / COORD_SCALE
+
+    slot_schedule = build_non_reuse_slot_schedule(trajectories, tau, max_targets)
+    tracked_states = {traj['label']: [] for traj in trajectories}
+    frame_pred_xyz = []
+    frame_true_xyz = []
+    frame_assoc_acc = []
+    frame_assoc_detail = []
+
+    with torch.no_grad():
+        for frame_idx in range(tau, num_frames):
+            past = []
+            num_past = []
+            for t in range(frame_idx - tau, frame_idx):
+                frame_states = [np.zeros(5, dtype=np.float32) for _ in range(max_targets)]
+                for traj in trajectories:
+                    entry = slot_schedule.get(traj['label'])
+                    if entry is None or frame_idx < entry['confirm_frame']:
+                        continue
+                    if traj['birth_frame'] <= t <= traj['death_frame']:
+                        slot = entry['slot']
+                        xyz = traj['states'][t, :3]
+                        frame_states[slot] = np.array(
+                            [slot + 1, xyz[0], xyz[1], xyz[2], t / 30.0],
+                            dtype=np.float32,
+                        )
+                num_past.append(sum(1 for state in frame_states if state[0] > 0))
+                past.extend(frame_states)
+
+            past_np = np.array(past, dtype=np.float32)
+            meas_np = prepare_measurements(measurements[frame_idx], max_measurements)
+            n_meas_raw = len(measurements[frame_idx])
+            n_meas = min(n_meas_raw, max_measurements)
+
+            past_t = torch.FloatTensor(past_np).unsqueeze(0).to(device)
+            meas_t = torch.FloatTensor(meas_np).unsqueeze(0).to(device)
+            npast_t = torch.LongTensor([num_past]).to(device)
+            nmeas_t = torch.LongTensor([n_meas]).to(device)
+            match_prob, filtered_states, _ = model(past_t, meas_t, npast_t, nmeas_t)
+            filtered_np = filtered_states[0].cpu().numpy()
+            match_np = match_prob[0].cpu().numpy()
+
+            gt_assoc_frame = gt_associations[frame_idx][:n_meas]
+            gt_assoc_slot = np.zeros_like(gt_assoc_frame)
+            for i, lbl in enumerate(gt_assoc_frame):
+                entry = slot_schedule.get(int(lbl))
+                if lbl == 0 or entry is None or frame_idx < entry['confirm_frame']:
+                    gt_assoc_slot[i] = 0
+                else:
+                    gt_assoc_slot[i] = entry['slot'] + 1
+
+            pred_assoc = np.argmax(match_np[:n_meas, 1:], axis=1) + 1
+            valid = gt_assoc_slot > 0
+            acc = float((pred_assoc[valid] == gt_assoc_slot[valid]).sum() / valid.sum()) if valid.sum() > 0 else 0.0
+            detail_rows = []
+            for vi in np.where(valid)[0]:
+                detail_rows.append({
+                    'meas_idx': int(vi),
+                    'pos_real': (measurements[frame_idx][vi] * COORD_SCALE).tolist(),
+                    'pred_label': int(pred_assoc[vi]),
+                    'gt_label': int(gt_assoc_slot[vi]),
+                    'correct': bool(pred_assoc[vi] == gt_assoc_slot[vi]),
+                })
+            frame_assoc_acc.append(acc)
+            frame_assoc_detail.append(detail_rows)
+
+            pred_xyz_frame = []
+            true_xyz_frame = []
+            for traj in trajectories:
+                entry = slot_schedule.get(traj['label'])
+                if entry is None or frame_idx < entry['confirm_frame']:
+                    tracked_states[traj['label']].append(np.zeros(3))
+                    continue
+                if traj['birth_frame'] <= frame_idx <= traj['death_frame']:
+                    slot = entry['slot']
+                    pred_xyz_frame.append(filtered_np[slot])
+                    true_xyz_frame.append(traj['states'][frame_idx, :3])
+                    tracked_states[traj['label']].append(filtered_np[slot].copy())
+                else:
+                    tracked_states[traj['label']].append(np.zeros(3))
+
+            frame_pred_xyz.append(np.array(pred_xyz_frame) if pred_xyz_frame else np.empty((0, 3)))
+            frame_true_xyz.append(np.array(true_xyz_frame) if true_xyz_frame else np.empty((0, 3)))
+            print(f"  frame {frame_idx:3d} | confirmed_gt={len(true_xyz_frame):2d} assoc={acc*100:.1f}%")
+
+    return {
+        'trajectories': trajectories,
+        'measurements': measurements,
+        'gt_associations': gt_associations,
+        'frame_pred_xyz': frame_pred_xyz,
+        'frame_true_xyz': frame_true_xyz,
+        'frame_assoc_acc': frame_assoc_acc,
+        'frame_assoc_detail': frame_assoc_detail,
+        'tau': tau,
+        'num_frames': num_frames,
+        'tracked_states': tracked_states,
+    }
+
+
+def evaluate_scenario_phd_managed(
+    model,
+    scenario,
+    tau,
+    max_targets,
+    max_measurements,
+    device,
+    scenario_idx,
+    phd_params=None,
+):
+    model.eval()
+    print(f"\n{'='*60}")
+    print(f"Scenario {scenario_idx + 1} | PHD-managed BAIT")
+    print(f"{'='*60}")
+
+    trajectories, measurements, gt_associations = scenario
+    num_frames = len(measurements)
+
+    for traj in trajectories:
+        traj['states'][:, :3] /= COORD_SCALE
+    for fm in measurements:
+        if len(fm) > 0:
+            fm[:] = fm / COORD_SCALE
+
+    phd_kwargs = dict(
+        dt=1.0,
+        sigma_q=0.5,
+        sigma_r=50.0,
+        P_d=0.95,
+        P_s=0.99,
+        lambda_c=10.0,
+        birth_weight=0.01,
+        prune_thresh=1e-4,
+        merge_dist=1.0,
+    )
+    if phd_params:
+        for key in list(phd_kwargs.keys()):
+            if key in phd_params:
+                phd_kwargs[key] = phd_params[key]
+
+    tracker = PHDBAITTracker(
+        tau=tau,
+        max_targets=max_targets,
+        phd_kwargs=phd_kwargs,
+    )
+
+    frame_pred_xyz = []
+    frame_true_xyz = []
+    frame_assoc_acc = []
+    frame_assoc_detail = []
+    tracked_states = {traj['label']: [] for traj in trajectories}
+    diag_gate = 300.0 / COORD_SCALE
+    diag = {
+        'phd_expected': 0,
+        'phd_covered': 0,
+        'phd_false_confirmed': 0,
+        'phd_pos_errors_m': [],
+        'bait_assoc_correct': 0,
+        'bait_assoc_total': 0,
+        'bait_pred_errors_m': [],
+    }
+
+    with torch.no_grad():
+        for frame_idx in range(num_frames):
+            meas_np = prepare_measurements(measurements[frame_idx], max_measurements)
+            n_meas_raw = len(measurements[frame_idx])
+            n_meas = min(n_meas_raw, max_measurements)
+
+            estimates = tracker.step_phd(measurements[frame_idx])
+            tracker.update_tracks_from_phd(frame_idx, estimates)
+
+            eligible_tracks = [
+                tr for tr in tracker.confirmed_tracks()
+                if tr.confirmed_frame is not None and tr.confirmed_frame < frame_idx
+            ]
+
+            if frame_idx >= tau and eligible_tracks:
+                past_np, n_past = tracker.build_past_states(frame_idx, dt=1.0, total_time=30.0)
+                past_t = torch.FloatTensor(past_np).unsqueeze(0).to(device)
+                meas_t = torch.FloatTensor(meas_np).unsqueeze(0).to(device)
+                npast_t = torch.LongTensor([n_past]).to(device)
+                nmeas_t = torch.LongTensor([n_meas]).to(device)
+
+                match_prob, filtered_states, existence_probs = model(
+                    past_t, meas_t, npast_t, nmeas_t
+                )
+                filtered_np = filtered_states[0].cpu().numpy()
+                exist_np = existence_probs[0].cpu().numpy()
+                match_np = match_prob[0].cpu().numpy()
+                tracker.apply_bait_outputs(frame_idx, filtered_np, exist_np)
+            else:
+                filtered_np = None
+                match_np = None
+
+            active_trajs = [
+                tr for tr in trajectories
+                if tr['birth_frame'] <= frame_idx <= tr['death_frame']
+            ]
+            true_xyz = np.array([tr['states'][frame_idx, :3] for tr in active_trajs]) \
+                if active_trajs else np.empty((0, 3))
+
+            pred_items = []
+            pred_slots = []
+            for tr in tracker.confirmed_tracks():
+                if tr.confirmed_frame is not None and tr.confirmed_frame < frame_idx:
+                    xyz = tr.history.get(frame_idx)
+                    if xyz is not None:
+                        pred_items.append(xyz)
+                        pred_slots.append(tr.slot)
+            pred_xyz = np.array(pred_items) if pred_items else np.empty((0, 3))
+            slot_to_gt_label = {}
+
+            if len(pred_xyz) > 0 and len(true_xyz) > 0:
+                cost = np.linalg.norm(pred_xyz[:, None, :] - true_xyz[None, :, :], axis=2)
+                rows, cols = linear_sum_assignment(cost)
+                aligned_pred = np.full_like(true_xyz, np.nan)
+                matched_rows = set()
+                matched_cols = set()
+                for r, c in zip(rows, cols):
+                    if cost[r, c] <= diag_gate:
+                        aligned_pred[c] = pred_xyz[r]
+                        matched_rows.add(int(r))
+                        matched_cols.add(int(c))
+                        diag['phd_pos_errors_m'].append(float(cost[r, c] * COORD_SCALE))
+                        if r < len(pred_slots):
+                            slot_to_gt_label[pred_slots[r]] = active_trajs[c]['label']
+            elif len(true_xyz) > 0:
+                aligned_pred = np.full_like(true_xyz, np.nan)
+                matched_rows = set()
+                matched_cols = set()
+            else:
+                aligned_pred = np.empty((0, 3))
+                matched_rows = set()
+                matched_cols = set()
+
+            if frame_idx >= tau:
+                eligible_gt_cols = [
+                    j for j, tr in enumerate(active_trajs)
+                    if frame_idx >= int(tr['birth_frame']) + tau
+                ]
+                diag['phd_expected'] += len(eligible_gt_cols)
+                diag['phd_covered'] += sum(1 for j in eligible_gt_cols if j in matched_cols)
+                diag['phd_false_confirmed'] += max(0, len(pred_items) - len(matched_rows))
+
+                frame_pred_xyz.append(aligned_pred)
+                frame_true_xyz.append(true_xyz)
+
+                if match_np is not None and n_meas > 0:
+                    gt_assoc_frame = gt_associations[frame_idx][:n_meas]
+                    pred_slots_for_meas = np.argmax(match_np[:n_meas, 1:], axis=1)
+                    valid = np.array([
+                        int(lbl) in set(slot_to_gt_label.values())
+                        for lbl in gt_assoc_frame
+                    ], dtype=bool)
+                    correct = 0
+                    detail_rows = []
+                    for mi in np.where(valid)[0]:
+                        slot = int(pred_slots_for_meas[mi])
+                        pred_label = int(slot_to_gt_label.get(slot, -1))
+                        gt_label = int(gt_assoc_frame[mi])
+                        is_correct = pred_label == gt_label
+                        correct += int(is_correct)
+                        diag['bait_assoc_total'] += 1
+                        diag['bait_assoc_correct'] += int(is_correct)
+                        detail_rows.append({
+                            'meas_idx': int(mi),
+                            'pos_real': (measurements[frame_idx][mi] * COORD_SCALE).tolist(),
+                            'pred_label': pred_label,
+                            'gt_label': gt_label,
+                            'correct': bool(is_correct),
+                        })
+                    acc = float(correct / valid.sum()) if valid.sum() > 0 else 0.0
+                else:
+                    acc = 0.0
+                    detail_rows = []
+                frame_assoc_acc.append(acc)
+                frame_assoc_detail.append(detail_rows)
+
+                if filtered_np is not None:
+                    label_to_true = {
+                        int(tr['label']): tr['states'][frame_idx, :3]
+                        for tr in active_trajs
+                    }
+                    for slot, gt_label in slot_to_gt_label.items():
+                        if slot is None or slot >= len(filtered_np) or gt_label not in label_to_true:
+                            continue
+                        err_m = np.linalg.norm(
+                            (filtered_np[int(slot)] - label_to_true[int(gt_label)]) * COORD_SCALE
+                        )
+                        if not np.isnan(err_m):
+                            diag['bait_pred_errors_m'].append(float(err_m))
+
+            active_label_to_idx = {
+                tr['label']: j for j, tr in enumerate(active_trajs)
+            }
+            for tr in trajectories:
+                j = active_label_to_idx.get(tr['label'])
+                if frame_idx >= tau and j is not None and j < len(aligned_pred):
+                    tracked_states[tr['label']].append(aligned_pred[j].copy())
+                else:
+                    tracked_states[tr['label']].append(np.zeros(3))
+
+            print(
+                f"  frame {frame_idx:3d} | phd_est={len(estimates):2d} "
+                f"confirmed={len(tracker.confirmed_tracks()):2d} "
+                f"bait={'on' if filtered_np is not None else 'off'} "
+                f"assoc={acc*100:.1f}% "
+                f"gru_cov={(diag['phd_covered']/max(diag['phd_expected'],1))*100:.1f}%" if frame_idx >= tau else
+                f"  frame {frame_idx:3d} | phd_est={len(estimates):2d} "
+                f"confirmed={len(tracker.confirmed_tracks()):2d} "
+                f"bait={'on' if filtered_np is not None else 'off'}"
+            )
+
+    diagnostics = {
+        'phd_confirm_recall': diag['phd_covered'] / max(diag['phd_expected'], 1),
+        'phd_false_confirmed': diag['phd_false_confirmed'],
+        'phd_mean_pos_error_m': float(np.mean(diag['phd_pos_errors_m'])) if diag['phd_pos_errors_m'] else float('nan'),
+        'bait_assoc_on_confirmed': diag['bait_assoc_correct'] / max(diag['bait_assoc_total'], 1),
+        'bait_assoc_total': diag['bait_assoc_total'],
+        'bait_mean_pred_error_m': float(np.mean(diag['bait_pred_errors_m'])) if diag['bait_pred_errors_m'] else float('nan'),
+    }
+    print(
+        "\n[PHD+BAIT diagnostics] "
+        f"PHD confirm recall={diagnostics['phd_confirm_recall']*100:.1f}% | "
+        f"PHD false confirmed={diagnostics['phd_false_confirmed']} | "
+        f"PHD confirmed pos err={diagnostics['phd_mean_pos_error_m']:.1f}m | "
+        f"BAIT assoc on confirmed={diagnostics['bait_assoc_on_confirmed']*100:.1f}% | "
+        f"BAIT pred err={diagnostics['bait_mean_pred_error_m']:.1f}m"
+    )
+
+    return {
+        'trajectories': trajectories,
+        'measurements': measurements,
+        'gt_associations': gt_associations,
+        'frame_pred_xyz': frame_pred_xyz,
+        'frame_true_xyz': frame_true_xyz,
+        'frame_assoc_acc': frame_assoc_acc,
+        'frame_assoc_detail': frame_assoc_detail,
+        'tau': tau,
+        'num_frames': num_frames,
+        'tracked_states': tracked_states,
+        'diagnostics': diagnostics,
+    }
+
+
 
 def plot_3d_trajectories(result, scenario_idx, output_dir):
     """三维轨迹图：真实轨迹（虚线）+ 预测轨迹（实线）+ 测量点（灰色散点）"""
@@ -323,19 +656,18 @@ def plot_3d_trajectories(result, scenario_idx, output_dir):
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(len(trajectories), 1)))
 
-    # ---- 先收集所有真实轨迹点，用于自适应坐标轴 ----
     traj_pts_all = []
 
-    # 真实轨迹（虚线）
     for idx, traj in enumerate(trajectories):
-        xyz = traj['states'][:, :3] * COORD_SCALE
+        b = int(traj.get('birth_frame', 0))
+        d = int(traj.get('death_frame', len(traj['states']) - 1))
+        xyz = traj['states'][b:d + 1, :3] * COORD_SCALE
         traj_pts_all.append(xyz)
         c   = colors[idx % len(colors)]
         ax.plot(xyz[:, 0], xyz[:, 1], xyz[:, 2],
                 '--', color=c, linewidth=1.8, alpha=0.7,
                 label=f'GT traj{traj["label"]}')
 
-    # 预测轨迹（实线）
     for idx, traj in enumerate(trajectories):
         lbl  = traj['label']
         hist = tracked_states.get(lbl, [])
@@ -351,7 +683,6 @@ def plot_3d_trajectories(result, scenario_idx, output_dir):
                     '-', color=c, linewidth=2.5, alpha=1.0,
                     label=f'Pred traj{lbl}')
 
-    # ---- 自适应坐标轴（基于轨迹点，不受杂波范围影响）----
     if traj_pts_all:
         all_traj = np.vstack(traj_pts_all)
         xmin, xmax = np.nanmin(all_traj[:, 0]), np.nanmax(all_traj[:, 0])
@@ -364,7 +695,6 @@ def plot_3d_trajectories(result, scenario_idx, output_dir):
             ax.set_ylim(yc - half, yc + half)
             ax.set_zlim(zc - half, zc + half)
 
-    # 测量点：只绘制落在坐标轴范围内的点，避免杂波撑开视野
     xlim = ax.get_xlim(); ylim = ax.get_ylim(); zlim = ax.get_zlim()
     all_meas = []
     for fm in measurements[tau:]:
@@ -409,8 +739,6 @@ def plot_error_curves(result, scenario_idx, output_dir):
     n_traj = len(trajectories)
     colors = plt.cm.tab10(np.linspace(0, 1, max(n_traj, 1)))
 
-    # 逐轨迹逐帧误差
-    # traj_errors[i] = {x:[], y:[], z:[], dist:[]} 按帧
     traj_errors = [{} for _ in range(n_traj)]
     for i in range(n_traj):
         traj_errors[i] = {'x': [], 'y': [], 'z': [], 'dist': [], 'frames': []}
@@ -451,7 +779,6 @@ def plot_error_curves(result, scenario_idx, output_dir):
                 if not np.isnan(v):                  # NaN 帧（目标丢失）不计入均值
                     all_vals_by_frame.setdefault(f, []).append(v)
 
-        # 平均线
         if all_vals_by_frame:
             avg_fr  = sorted(all_vals_by_frame.keys())
             avg_val = [np.nanmean(all_vals_by_frame[f]) for f in avg_fr]
@@ -489,7 +816,6 @@ def plot_ospa_curve(result, scenario_idx, output_dir):
         if len(pred) == 0 and len(true) == 0:
             ospa_vals.append(0.0); ospa_loc_vals.append(0.0); ospa_card_vals.append(0.0)
             continue
-        # 过滤 NaN 行：NaN 表示该目标丢失，OSPA 按漏检（基数误差）计
         if len(pred) > 0:
             valid = ~np.any(np.isnan(pred), axis=1)
             pred3 = pred[valid] if valid.any() else np.empty((0, 3))
@@ -581,9 +907,6 @@ def plot_overall_summary(all_results, output_dir):
     print(f"\n  [图] 汇总对比图 → {path}")
 
 
-# ============================================================
-# main
-# ============================================================
 
 def main():
     args = parse_args()
@@ -592,7 +915,6 @@ def main():
     print(f"使用设备: {device}")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # —— 加载模型 ——
     print(f"\n加载检查点: {args.checkpoint}")
     ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model = BAIT(
@@ -604,15 +926,12 @@ def main():
         dim_feedforward_associate=1024,
         dim_feedforward_filtering=2048,
         max_targets=args.max_targets
-        # state_dim=5, measurement_dim=3 — 使用默认值
     ).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
     print(f"模型加载成功！（来自训练步骤 {ckpt.get('step', '?')}）")
 
-    # ── 场景来源 ──────────────────────────────────────────────────
 
-    # 优先级最高：直接指定 pkl 文件（用于多场景分类评估）
     if args.scenarios_pkl is not None:
         print(f"\n场景来源: 指定 PKL 文件")
         print(f"  路径: {args.scenarios_pkl}")
@@ -621,7 +940,6 @@ def main():
         print(f"  共 {len(_all_scenarios)} 条场景，本次评估前 {args.num_scenarios} 条")
 
         def get_scenario(idx):
-            # deepcopy 防止 evaluate_scenario 的原地归一化污染原始数据
             return copy.deepcopy(_all_scenarios[idx % len(_all_scenarios)])
 
     elif args.scene_source == 'new':
@@ -645,7 +963,6 @@ def main():
         print(f"\n场景来源: VAL_SPLIT（训练时验证集，seed=142）")
         ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
 
-        # 优先查找 val_scenarios.pkl（crossing-only 训练模式）
         val_pkl_single = os.path.join(ckpt_dir, 'val_scenarios.pkl')
         if os.path.exists(val_pkl_single):
             print(f"  加载验证集场景: {val_pkl_single}")
@@ -655,7 +972,6 @@ def main():
             def get_scenario(idx):
                 return copy.deepcopy(all_saved_scenarios[idx % len(all_saved_scenarios)])
         else:
-            # 没有单文件时，尝试合并 val_scenarios_{type}.pkl（多场景训练模式）
             try:
                 from data_generation_multi_scenario import SCENARIO_TYPES
                 merged = []
@@ -673,7 +989,6 @@ def main():
                 else:
                     raise FileNotFoundError("未找到任何 val_scenarios*.pkl 文件")
             except FileNotFoundError:
-                # 终极回退：用 seed=142 重新生成（与训练时 create_dataloaders_multi_scenario 一致）
                 print(f"  未找到已保存的验证集 pkl，回退到 seed=142 重新生成")
                 print(f"  ⚠ 请确保 --test-crossing-prob 与训练 config 中的 crossing_probability 一致！")
                 try:
@@ -692,7 +1007,6 @@ def main():
                     def get_scenario(idx):
                         return copy.deepcopy(all_saved_scenarios[idx % len(all_saved_scenarios)])
                 except Exception:
-                    # 最终回退到 crossing-only 验证集
                     print(f"  多场景生成器不可用，回退到 crossing-only 验证集（seed=142）")
                     val_dataset = MTTDatasetWithCrossing(
                         num_scenarios=args.num_scenarios,
@@ -708,7 +1022,6 @@ def main():
 
     else:  # test_split
         print(f"\n场景来源: TEST_SPLIT")
-        # 优先从 checkpoint 同目录加载训练时保存的测试场景文件
         ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
         saved_path = os.path.join(ckpt_dir, 'test_scenarios.pkl')
 
@@ -720,7 +1033,6 @@ def main():
             def get_scenario(idx):
                 return copy.deepcopy(all_saved_scenarios[idx % len(all_saved_scenarios)])
         else:
-            # 回退：用相同 seed 重新生成（要求参数与训练完全一致）
             print(f"  [test_split] 未找到 {saved_path}，回退到 seed={args.test_seed} 重新生成")
             print(f"  ⚠ 请确保 --test-crossing-prob 与训练 config 中的 crossing_probability 一致！")
             print(f"  交叉场景概率: {args.test_crossing_prob * 100:.0f}%")
@@ -736,24 +1048,22 @@ def main():
             def get_scenario(idx):
                 return test_dataset.scenarios[idx % len(test_dataset.scenarios)]
 
-    # —— 逐场景评估 ——
     all_results = []
 
     for s_idx in range(args.num_scenarios):
         scenario = get_scenario(s_idx)
-        result = evaluate_scenario(
+        eval_fn = evaluate_scenario_phd_managed if args.phd_managed else evaluate_scenario
+        result = eval_fn(
             model, scenario,
             args.tau, args.max_targets, args.max_measurements,
             device, s_idx
         )
 
-        # 绘图
         plot_3d_trajectories(result, s_idx, args.output_dir)
         plot_error_curves(result, s_idx, args.output_dir)
         avg_ospa = plot_ospa_curve(result, s_idx, args.output_dir)
         plot_association_accuracy(result, s_idx, args.output_dir)
 
-        # 场景统计
         avg_acc = np.mean(result['frame_assoc_acc'])
 
         all_dist_errors = []
@@ -775,11 +1085,9 @@ def main():
             'avg_dist_error': float(avg_dist),
         })
 
-    # —— 汇总图 ——
     if len(all_results) > 1:
         plot_overall_summary(all_results, args.output_dir)
 
-    # —— 控制台汇总 ——
     print(f"\n{'='*60}")
     print("Overall Evaluation Summary")
     print(f"{'='*60}")
@@ -794,7 +1102,6 @@ def main():
           f"{np.mean([r['avg_dist_error'] for r in all_results]):>14.2f}")
     print(f"{'='*60}")
 
-    # —— 保存 JSON ——
     summary = {
         'checkpoint': args.checkpoint,
         'num_scenarios': args.num_scenarios,

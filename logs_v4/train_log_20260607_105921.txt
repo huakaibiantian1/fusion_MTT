@@ -1,0 +1,78 @@
+训练日志将同步写入: logs_v4\train_log_20260607_105921.txt
+
+配置已保存到 checkpoints_v4\config_20260607_105921.json
+创建数据加载器...
+
+============================================================
+使用多场景训练数据（4 种类型等量混合）
+  类型: ['crossing', 'many_targets', 'high_maneuver', 'spindle']
+============================================================
+
+
+创建多场景训练集（seed=42）...
+
+============================================================
+多场景数据集: 4 种类型 × 500 = 2000 条场景
+============================================================
+  生成 crossing       × 500 条...
+    200/500
+    400/500
+  生成 many_targets   × 500 条...
+    200/500
+    400/500
+  生成 high_maneuver  × 500 条...
+    200/500
+    400/500
+  生成 spindle        × 500 条...
+    200/500
+    400/500
+数据集生成完毕！
+
+创建多场景验证集（seed=142）...
+
+============================================================
+多场景数据集: 4 种类型 × 50 = 200 条场景
+============================================================
+  生成 crossing       × 50 条...
+  生成 many_targets   × 50 条...
+  生成 high_maneuver  × 50 条...
+  生成 spindle        × 50 条...
+数据集生成完毕！
+
+创建多场景测试集（seed=242）...
+
+============================================================
+多场景数据集: 4 种类型 × 50 = 200 条场景
+============================================================
+  生成 crossing       × 50 条...
+  生成 many_targets   × 50 条...
+  生成 high_maneuver  × 50 条...
+  生成 spindle        × 50 条...
+数据集生成完毕！
+测试集 'crossing' 已保存 → checkpoints_v4\test_scenarios_crossing.pkl（50 条）
+测试集 'many_targets' 已保存 → checkpoints_v4\test_scenarios_many_targets.pkl（50 条）
+测试集 'high_maneuver' 已保存 → checkpoints_v4\test_scenarios_high_maneuver.pkl（50 条）
+测试集 'spindle' 已保存 → checkpoints_v4\test_scenarios_spindle.pkl（50 条）
+验证集 'crossing' 已保存 → checkpoints_v4\val_scenarios_crossing.pkl（50 条）
+验证集 'many_targets' 已保存 → checkpoints_v4\val_scenarios_many_targets.pkl（50 条）
+验证集 'high_maneuver' 已保存 → checkpoints_v4\val_scenarios_high_maneuver.pkl（50 条）
+验证集 'spindle' 已保存 → checkpoints_v4\val_scenarios_spindle.pkl（50 条）
+训练集 'crossing' 已保存 → checkpoints_v4\train_scenarios_crossing.pkl（500 条）
+训练集 'many_targets' 已保存 → checkpoints_v4\train_scenarios_many_targets.pkl（500 条）
+训练集 'high_maneuver' 已保存 → checkpoints_v4\train_scenarios_high_maneuver.pkl（500 条）
+训练集 'spindle' 已保存 → checkpoints_v4\train_scenarios_spindle.pkl（500 条）
+训练批次数: 407
+验证批次数: 41
+测试批次数: 41
+创建模型...
+可训练参数数量: 23,712,666
+
+开始训练...
+步骤 0/300000 | 总损失: 5.5273 | 关联损失: 4.3243 | 关联准确率: 0.2% | 滤波损失: 0.6265 | 存在性损失: 1.1531 | 位置误差: 22693.6m | LR: 1.00e-04
+
+验证中...
+验证(全量) - 总损失: 1.4614 | 关联准确率: 91.6% | 位置误差: 24176.2m | 存在性损失: 0.2254 | OSPA: 0.3420 | 位置OSPA: 0.3420 | 数量OSPA: 0.0000
+  分场景关联准确率 → crossing: 85.6% | many_targets: 92.6% | high_maneuver: 94.0% | spindle: 94.7%
+保存最佳模型，OSPA: 0.3420
+步骤 100/300000 | 总损失: 1.0270 | 关联损失: 0.3591 | 关联准确率: 92.2% | 滤波损失: 0.6304 | 存在性损失: 0.0750 | 位置误差: 22737.8m | LR: 1.00e-04
+步骤 200/300000 | 总损失: 0.9607 | 关联损失: 0.3953 | 关联准确率: 91.3% | 滤波损失: 0.5211 | 存在性损失: 0.0887 | 位置误差: 20056.6m | LR: 1.00e-04

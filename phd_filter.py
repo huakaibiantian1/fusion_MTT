@@ -121,7 +121,7 @@ class GMPHDFilter:
             return 1e-300
         exponent = -0.5 * (dz @ S_inv @ dz)
         log_pdf  = -0.5 * (d * np.log(2 * np.pi) + log_det) + exponent
-        return float(np.exp(np.clip(log_pdf, -10, 10)))
+        return float(np.exp(np.clip(log_pdf, -700, 700)))
 
     # ------------------------------------------------------------------
     # 预测步

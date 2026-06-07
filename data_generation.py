@@ -20,9 +20,6 @@ from torch.utils.data import Dataset, DataLoader
 from scipy.stats import poisson
 
 
-# ============================================================
-# 坐标系转换
-# ============================================================
 
 def spherical_to_cartesian(r, alpha, beta):
     """球坐标 → 笛卡尔坐标"""
@@ -40,15 +37,38 @@ def cartesian_to_spherical(x, y, z):
     return r, alpha, beta
 
 
-# ============================================================
-# 归一化常数（与坐标范围匹配：R_max ≈ 50000 m）
-# ============================================================
 COORD_SCALE = 50000.0
 
 
-# ============================================================
-# 数据生成器
-# ============================================================
+def build_non_reuse_slot_schedule(trajectories, tau, max_targets):
+    """
+    Assign BAIT slots monotonically after a track has accumulated tau frames.
+
+    A trajectory is eligible for BAIT supervision from birth_frame + tau onward.
+    Slots are never reused after a trajectory dies; later births get later slots.
+    Returns: {trajectory_label: {'slot': int, 'confirm_frame': int}}
+    """
+    candidates = []
+    for traj in trajectories:
+        confirm_frame = int(traj['birth_frame']) + int(tau)
+        if confirm_frame <= int(traj['death_frame']):
+            candidates.append((confirm_frame, int(traj['label']), traj))
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+
+    schedule = {}
+    next_slot = 0
+    for confirm_frame, label, _ in candidates:
+        if next_slot >= max_targets:
+            break
+        schedule[label] = {
+            'slot': next_slot,
+            'confirm_frame': confirm_frame,
+        }
+        next_slot += 1
+    return schedule
+
+
 
 class MTTDataGenerator:
     """
@@ -81,7 +101,6 @@ class MTTDataGenerator:
         self.lambda_0      = lambda_0
         self.P_d           = P_d
 
-        # 任务特定参数
         if task_type == 1:
             self.q_s      = 0.5    # 过程噪声强度 (m²/s³)
             self.sigma_r  = 50.0   # 距离测量噪声标准差 (m)
@@ -102,9 +121,37 @@ class MTTDataGenerator:
         if seed is not None:
             np.random.seed(seed)
 
-    # ----------------------------------------------------------
-    # 场景生成
-    # ----------------------------------------------------------
+    def _randomize_trajectory_lifetimes(self, trajectories, min_lifetime=21):
+        randomized = []
+        for traj in trajectories:
+            if traj.get('lifetime_randomized', False):
+                randomized.append(traj)
+                continue
+            states_len = len(traj['states'])
+            if states_len < min_lifetime:
+                continue
+
+            old_birth = int(traj.get('birth_frame', 0))
+            old_death = int(traj.get('death_frame', states_len - 1))
+            last_valid = min(states_len - 1, self.num_frames - 1, old_death)
+            first_valid = max(0, old_birth)
+
+            if last_valid - first_valid + 1 < min_lifetime:
+                continue
+
+            max_birth = last_valid - min_lifetime + 1
+            birth = np.random.randint(first_valid, max_birth + 1)
+            max_lifetime = last_valid - birth + 1
+            lifetime = np.random.randint(min_lifetime, max_lifetime + 1)
+            death = birth + lifetime - 1
+
+            traj['birth_frame'] = int(birth)
+            traj['death_frame'] = int(death)
+            traj['lifetime_randomized'] = True
+            randomized.append(traj)
+
+        return randomized
+
 
     def generate_single_scenario(self):
         """
@@ -117,6 +164,7 @@ class MTTDataGenerator:
         num_targets = max(1, poisson.rvs(self.lambda_0))
 
         trajectories = [self._generate_single_trajectory(i + 1) for i in range(num_targets)]
+        trajectories = self._randomize_trajectory_lifetimes(trajectories)
 
         measurements, associations = [], []
         for t in range(self.num_frames):
@@ -140,9 +188,6 @@ class MTTDataGenerator:
 
         return trajectories, measurements, associations
 
-    # ----------------------------------------------------------
-    # 3D 测量：球坐标加噪声 → xyz
-    # ----------------------------------------------------------
 
     def _measure_3d(self, true_xyz):
         """真实位置 → 球坐标加噪声 → 返回含噪 xyz"""
@@ -154,9 +199,6 @@ class MTTDataGenerator:
 
         return np.array(spherical_to_cartesian(r_m, a_m, b_m))
 
-    # ----------------------------------------------------------
-    # 单条轨迹生成（3D CV 模型）
-    # ----------------------------------------------------------
 
     def _generate_single_trajectory(self, label):
         """
@@ -168,13 +210,11 @@ class MTTDataGenerator:
         Q  = self._cv_Q(dt)
 
         for _ in range(200):
-            # 球坐标均匀初始位置
             r0    = np.random.uniform(self.r_min, self.r_max)
             a0    = np.random.uniform(-self.alpha_max, self.alpha_max)
             b0    = np.random.uniform(0, 2 * np.pi)
             xyz0  = np.array(spherical_to_cartesian(r0, a0, b0))
 
-            # 随机 3D 速度方向（球面均匀采样）
             v_mag = np.random.uniform(*self.velocity_range)
             phi   = np.random.uniform(0, np.pi)
             theta = np.random.uniform(0, 2 * np.pi)
@@ -200,12 +240,10 @@ class MTTDataGenerator:
                 return {'label': label, 'states': states,
                         'birth_frame': 0, 'death_frame': self.num_frames - 1}
 
-        # 保底：切向低速轨迹（确保始终在视野内）
         r0   = np.random.uniform(self.r_min * 1.1, self.r_max * 0.9)
         a0   = 0.0
         b0   = np.random.uniform(0, 2 * np.pi)
         xyz0 = np.array(spherical_to_cartesian(r0, a0, b0))
-        # 切向速度（在 xy 平面内旋转）
         v_mag = np.random.uniform(*self.velocity_range)
         v0    = v_mag * np.array([-np.sin(b0), np.cos(b0), 0.0])
 
@@ -219,9 +257,6 @@ class MTTDataGenerator:
         return {'label': label, 'states': states,
                 'birth_frame': 0, 'death_frame': self.num_frames - 1}
 
-    # ----------------------------------------------------------
-    # 杂波生成（球坐标均匀采样 → xyz）
-    # ----------------------------------------------------------
 
     def _generate_clutter(self):
         r    = np.random.uniform(self.r_min, self.r_max)
@@ -229,22 +264,15 @@ class MTTDataGenerator:
         b    = np.random.uniform(0, 2 * np.pi)
         return np.array(spherical_to_cartesian(r, a, b))
 
-    # ----------------------------------------------------------
-    # 视野检查
-    # ----------------------------------------------------------
 
     def _in_fov(self, pos):
         """检查 3D 位置是否在球坐标观测体积内"""
         r, alpha, _ = cartesian_to_spherical(*pos)
         return (self.r_min <= r <= self.r_max) and (abs(alpha) <= self.alpha_max)
 
-    # 保留旧名称兼容性
     def _in_field_of_view_3d(self, pos):
         return self._in_fov(pos)
 
-    # ----------------------------------------------------------
-    # 3D CV 矩阵
-    # ----------------------------------------------------------
 
     @staticmethod
     def _cv_F(dt):
@@ -268,9 +296,6 @@ class MTTDataGenerator:
         ])
 
 
-# ============================================================
-# 数据集
-# ============================================================
 
 class MTTDataset(Dataset):
     """
@@ -302,8 +327,29 @@ class MTTDataset(Dataset):
 
     def _create_sample_indices(self):
         self.sample_indices = []
-        for s_idx, (_, meas, _) in enumerate(self.scenarios):
+        for s_idx, (trajectories, meas, _) in enumerate(self.scenarios):
+            if len(meas) <= self.tau:
+                continue
+            slot_schedule = build_non_reuse_slot_schedule(
+                trajectories, self.tau, self.max_targets
+            )
+            valid_frames = []
             for f_idx in range(self.tau, len(meas)):
+                has_confirmed_active = False
+                for traj in trajectories:
+                    entry = slot_schedule.get(traj['label'])
+                    if entry is None or f_idx < entry['confirm_frame']:
+                        continue
+                    if traj['birth_frame'] <= f_idx <= traj['death_frame']:
+                        has_confirmed_active = True
+                        break
+                if has_confirmed_active:
+                    valid_frames.append(f_idx)
+
+            if not valid_frames:
+                continue
+
+            for f_idx in valid_frames:
                 self.sample_indices.append((s_idx, f_idx))
 
     def __len__(self):
@@ -312,82 +358,85 @@ class MTTDataset(Dataset):
     def __getitem__(self, idx):
         s_idx, f_idx = self.sample_indices[idx]
         trajectories, measurements, associations = self.scenarios[s_idx]
+        slot_schedule = build_non_reuse_slot_schedule(
+            trajectories, self.tau, self.max_targets
+        )
 
-        # ── 1. 过去 tau 帧的状态 [tau*max_targets, 5] ──
-        past_list       = []
+        past_list = []
         num_past_targets = []
 
         for t in range(f_idx - self.tau, f_idx):
-            frame_states = []
+            frame_states = [np.zeros(5) for _ in range(self.max_targets)]
             for traj in trajectories:
+                entry = slot_schedule.get(traj['label'])
+                if entry is None or f_idx < entry['confirm_frame']:
+                    continue
                 if traj['birth_frame'] <= t <= traj['death_frame']:
+                    slot = entry['slot']
                     xyz = traj['states'][t, :3]
-                    frame_states.append(np.array([
-                        traj['label'], xyz[0], xyz[1], xyz[2],
-                        (t * self.generator.dt) / self.generator.T  # 时间戳归一化到[0,1]
-                    ]))
-            num_past_targets.append(len(frame_states))
-            while len(frame_states) < self.max_targets:
-                frame_states.append(np.zeros(5))
-            past_list.extend(frame_states[:self.max_targets])
+                    frame_states[slot] = np.array([
+                        slot + 1,
+                        xyz[0],
+                        xyz[1],
+                        xyz[2],
+                        (t * self.generator.dt) / self.generator.T,
+                    ])
+            num_past_targets.append(sum(1 for state in frame_states if state[0] > 0))
+            past_list.extend(frame_states)
 
-        past_states = np.array(past_list)   # [tau*max_targets, 5]
+        past_states = np.array(past_list)
 
-        # ── 2. 当前帧测量 ──────────────────────────────────────
-        cur_meas  = measurements[f_idx].copy()
+        cur_meas = measurements[f_idx].copy()
         cur_assoc = associations[f_idx].copy()
-        n_meas    = len(cur_meas)
+        n_meas = len(cur_meas)
 
-        # 标签映射
-        lmap, lc = {}, 1
-        for traj in trajectories:
-            if traj['label'] not in lmap:
-                lmap[traj['label']] = min(lc, self.max_targets)
-                lc += 1
         assoc_mapped = np.zeros_like(cur_assoc)
         for i, lbl in enumerate(cur_assoc):
-            assoc_mapped[i] = 0 if lbl == 0 else lmap.get(lbl, self.max_targets)
+            entry = slot_schedule.get(int(lbl))
+            if lbl == 0 or entry is None or f_idx < entry['confirm_frame']:
+                assoc_mapped[i] = 0 if lbl == 0 else -1
+            else:
+                assoc_mapped[i] = entry['slot'] + 1
         cur_assoc = assoc_mapped
 
         if n_meas < self.max_measurements:
             pad_m = np.zeros((self.max_measurements - n_meas, 3))
             pad_a = np.zeros(self.max_measurements - n_meas)
-            cur_meas  = np.vstack([cur_meas, pad_m]) if n_meas > 0 else pad_m
+            cur_meas = np.vstack([cur_meas, pad_m]) if n_meas > 0 else pad_m
             cur_assoc = np.concatenate([cur_assoc, pad_a])
         else:
-            cur_meas  = cur_meas[:self.max_measurements]
+            cur_meas = cur_meas[:self.max_measurements]
             cur_assoc = cur_assoc[:self.max_measurements]
-            n_meas    = self.max_measurements
+            n_meas = self.max_measurements
 
-        # ── 3. Ground truth 状态 ───────────────────────────────
-        gt_list = []
+        gt_states = np.zeros((self.max_targets, 3), dtype=np.float32)
+        gt_slot_mask = np.zeros(self.max_targets, dtype=np.float32)
         for traj in trajectories:
+            entry = slot_schedule.get(traj['label'])
+            if entry is None or f_idx < entry['confirm_frame']:
+                continue
             if traj['birth_frame'] <= f_idx <= traj['death_frame']:
-                gt_list.append(traj['states'][f_idx, :3])
-        n_gt = len(gt_list)
-        while len(gt_list) < self.max_targets:
-            gt_list.append(np.zeros(3))
-        gt_states = np.array(gt_list[:self.max_targets])
+                slot = entry['slot']
+                gt_states[slot] = traj['states'][f_idx, :3]
+                gt_slot_mask[slot] = 1.0
+        n_gt = int(gt_slot_mask.sum())
 
-        # ── 4. 归一化 ──────────────────────────────────────────
-        past_states[:, 1:4] /= COORD_SCALE   # x, y, z
-        cur_meas            /= COORD_SCALE
-        gt_states           /= COORD_SCALE
+        past_states[:, 1:4] /= COORD_SCALE
+        cur_meas /= COORD_SCALE
+        gt_states /= COORD_SCALE
 
         return {
-            'past_states':              torch.FloatTensor(past_states),
-            'current_measurements':     torch.FloatTensor(cur_meas),
-            'gt_associations':          torch.LongTensor(cur_assoc.astype(np.int64)),
-            'gt_states':                torch.FloatTensor(gt_states),
-            'num_past_targets':         torch.LongTensor(num_past_targets),
+            'past_states': torch.FloatTensor(past_states),
+            'current_measurements': torch.FloatTensor(cur_meas),
+            'gt_associations': torch.LongTensor(cur_assoc.astype(np.int64)),
+            'gt_states': torch.FloatTensor(gt_states),
+            'gt_slot_mask': torch.FloatTensor(gt_slot_mask),
+            'num_past_targets': torch.LongTensor(num_past_targets),
             'num_current_measurements': torch.LongTensor([n_meas]),
-            'num_current_targets':      torch.LongTensor([n_gt])
+            'num_current_targets': torch.LongTensor([n_gt]),
         }
 
 
-# ============================================================
-# DataLoader 工厂
-# ============================================================
 
 def create_dataloaders(num_train_scenarios=800, num_val_scenarios=100,
                        num_test_scenarios=100, batch_size=16, tau=4,
@@ -406,9 +455,6 @@ def create_dataloaders(num_train_scenarios=800, num_val_scenarios=100,
     )
 
 
-# ============================================================
-# 快速测试
-# ============================================================
 
 if __name__ == "__main__":
     print("Testing 3D radar data generation...")
@@ -420,7 +466,6 @@ if __name__ == "__main__":
     print(f"轨迹0状态形状: {trajs[0]['states'].shape}")
     print(f"帧0测量形状:   {meas[0].shape}")
 
-    # 打印第一条轨迹的起始 R/alpha/beta
     xyz0 = trajs[0]['states'][0, :3]
     r, a, b = cartesian_to_spherical(*xyz0)
     print(f"\n轨迹0起始球坐标: R={r:.0f}m  alpha={np.degrees(a):.1f}°  beta={np.degrees(b):.1f}°")

@@ -68,6 +68,10 @@ class MTTDataGeneratorWithCrossing(MTTDataGenerator):
                 trajectories.append(traj)
                 label_counter += 1
 
+        trajectories = self._randomize_trajectory_lifetimes(trajectories)
+        if not trajectories:
+            return super().generate_single_scenario()
+
         # 生成测量（与父类逻辑一致：球坐标加噪声 → xyz）
         measurements, associations = [], []
         for t in range(self.num_frames):
