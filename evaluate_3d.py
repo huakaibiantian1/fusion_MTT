@@ -33,10 +33,26 @@ from data_generation_with_crossing import (
     MTTDatasetWithCrossing,
 )
 from metrics import TrackingMetrics
-from phd_bait_tracker import PHDBAITTracker
 from kf_bait_tracker import KFBAITTracker
-from ltm_bait_tracker import LTMBaitTracker
-from ltm_model import load_ltm_checkpoint
+
+try:
+    from phd_bait_tracker import PHDBAITTracker
+except ImportError:
+    PHDBAITTracker = None
+
+try:
+    from ltm_bait_tracker import LTMBaitTracker
+    from ltm_model import load_ltm_checkpoint
+except ImportError:
+    LTMBaitTracker = None
+    load_ltm_checkpoint = None
+
+try:
+    from ntm_bait_tracker import NTMBaitTracker
+    from ntm_model import load_ntm_checkpoint
+except ImportError:
+    NTMBaitTracker = None
+    load_ntm_checkpoint = None
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
@@ -161,6 +177,77 @@ def prepare_measurements(meas_frame, max_measurements):
     else:
         meas = meas[:max_measurements]
     return meas
+
+
+def update_manager_lifecycle_diag(diag, active_trajs, eligible_gt_cols, matched_cols, frame_idx, tau):
+    first_confirm = diag.setdefault('first_confirm_frame', {})
+    confirm_delays = diag.setdefault('confirm_delays', [])
+    diag.setdefault('post_expected', 0)
+    diag.setdefault('post_covered', 0)
+    diag.setdefault('post_missed', 0)
+    early_broken_labels = diag.setdefault('early_broken_labels', set())
+    early_broken_frames = diag.setdefault('early_broken_frames', [])
+
+    for j in eligible_gt_cols:
+        label = int(active_trajs[j]['label'])
+        ideal_frame = int(active_trajs[j]['birth_frame']) + int(tau)
+        death_frame = int(active_trajs[j]['death_frame'])
+        is_matched = j in matched_cols
+
+        if is_matched and label not in first_confirm:
+            first_confirm[label] = int(frame_idx)
+            confirm_delays.append(max(0, int(frame_idx) - ideal_frame))
+
+        if label in first_confirm and frame_idx >= first_confirm[label]:
+            diag['post_expected'] += 1
+            if is_matched:
+                diag['post_covered'] += 1
+            else:
+                diag['post_missed'] += 1
+                if frame_idx < death_frame:
+                    early_broken_labels.add(label)
+                    early_broken_frames.append(int(frame_idx) - int(first_confirm[label]))
+
+
+def update_manager_delayed_death_diag(diag, trajectories, pred_slots, matched_rows, slot_to_gt_label, frame_idx):
+    slot_last_label = diag.setdefault('slot_last_label', {})
+    slot_delay_active = diag.setdefault('slot_delay_active', {})
+    delayed_labels = diag.setdefault('delayed_death_labels', set())
+    delayed_frames = diag.setdefault('delayed_death_frames', [])
+    delayed_max = diag.setdefault('delayed_death_max_delay', {})
+    diag.setdefault('delayed_death_total_frames', 0)
+    label_to_death = {
+        int(tr['label']): int(tr['death_frame'])
+        for tr in trajectories
+    }
+
+    for slot, label in slot_to_gt_label.items():
+        slot_last_label[int(slot)] = int(label)
+        slot_delay_active.pop(int(slot), None)
+
+    for r, slot in enumerate(pred_slots):
+        slot = int(slot)
+        if r in matched_rows:
+            continue
+        label = slot_last_label.get(slot)
+        if label is None:
+            continue
+        death_frame = label_to_death.get(int(label))
+        if death_frame is None or frame_idx <= death_frame:
+            continue
+
+        delayed_labels.add(int(label))
+        diag['delayed_death_total_frames'] += 1
+        if slot not in slot_delay_active:
+            slot_delay_active[slot] = int(frame_idx)
+        delay = int(frame_idx) - int(death_frame)
+        delayed_frames.append(delay)
+        delayed_max[int(label)] = max(int(delayed_max.get(int(label), 0)), delay)
+
+
+def mean_delayed_death_frames(diag):
+    values = list(diag.get('delayed_death_max_delay', {}).values())
+    return float(np.mean(values)) if values else float('nan')
 
 
 
@@ -477,7 +564,7 @@ def evaluate_scenario_phd_managed(
                 if tr.confirmed_frame is not None and tr.confirmed_frame < frame_idx
             ]
 
-            if frame_idx >= tau and eligible_tracks:
+            if frame_idx >= tau and eligible_tracks and n_meas > 0:
                 past_np, n_past = tracker.build_past_states(
                     frame_idx, dt=1.0, total_time=float(max(num_frames, 1))
                 )
@@ -538,6 +625,10 @@ def evaluate_scenario_phd_managed(
                 matched_rows = set()
                 matched_cols = set()
 
+            update_manager_delayed_death_diag(
+                diag, trajectories, pred_slots, matched_rows, slot_to_gt_label, frame_idx
+            )
+
             if frame_idx >= tau:
                 eligible_gt_cols = [
                     j for j, tr in enumerate(active_trajs)
@@ -546,6 +637,9 @@ def evaluate_scenario_phd_managed(
                 diag['phd_expected'] += len(eligible_gt_cols)
                 diag['phd_covered'] += sum(1 for j in eligible_gt_cols if j in matched_cols)
                 diag['phd_false_confirmed'] += max(0, len(pred_items) - len(matched_rows))
+                update_manager_lifecycle_diag(
+                    diag, active_trajs, eligible_gt_cols, matched_cols, frame_idx, tau
+                )
 
                 frame_pred_xyz.append(aligned_pred)
                 frame_true_xyz.append(true_xyz)
@@ -621,6 +715,20 @@ def evaluate_scenario_phd_managed(
         'phd_confirm_recall': diag['phd_covered'] / max(diag['phd_expected'], 1),
         'phd_false_confirmed': diag['phd_false_confirmed'],
         'phd_mean_pos_error_m': float(np.mean(diag['phd_pos_errors_m'])) if diag['phd_pos_errors_m'] else float('nan'),
+        'manager_confirm_recall': diag['phd_covered'] / max(diag['phd_expected'], 1),
+        'manager_false_confirmed': diag['phd_false_confirmed'],
+        'manager_mean_pos_error_m': float(np.mean(diag['phd_pos_errors_m'])) if diag['phd_pos_errors_m'] else float('nan'),
+        'manager_post_confirm_coverage': diag.get('post_covered', 0) / max(diag.get('post_expected', 0), 1),
+        'manager_mean_confirm_delay': float(np.mean(diag.get('confirm_delays', []))) if diag.get('confirm_delays', []) else float('nan'),
+        'manager_confirmed_gt_count': len(diag.get('first_confirm_frame', {})),
+        'manager_post_confirm_miss_rate': diag.get('post_missed', 0) / max(diag.get('post_expected', 0), 1),
+        'manager_early_break_count': len(diag.get('early_broken_labels', set())),
+        'manager_early_break_rate': len(diag.get('early_broken_labels', set())) / max(len(diag.get('first_confirm_frame', {})), 1),
+        'manager_mean_frames_to_break': float(np.mean(diag.get('early_broken_frames', []))) if diag.get('early_broken_frames', []) else float('nan'),
+        'manager_delayed_death_count': len(diag.get('delayed_death_labels', set())),
+        'manager_delayed_death_rate': len(diag.get('delayed_death_labels', set())) / max(len(diag.get('first_confirm_frame', {})), 1),
+        'manager_delayed_death_frames': int(diag.get('delayed_death_total_frames', 0)),
+        'manager_mean_delayed_death': mean_delayed_death_frames(diag),
         'bait_assoc_on_confirmed': diag['bait_assoc_correct'] / max(diag['bait_assoc_total'], 1),
         'bait_assoc_total': diag['bait_assoc_total'],
         'bait_mean_pred_error_m': float(np.mean(diag['bait_pred_errors_m'])) if diag['bait_pred_errors_m'] else float('nan'),
@@ -630,6 +738,12 @@ def evaluate_scenario_phd_managed(
         f"PHD confirm recall={diagnostics['phd_confirm_recall']*100:.1f}% | "
         f"PHD false confirmed={diagnostics['phd_false_confirmed']} | "
         f"PHD confirmed pos err={diagnostics['phd_mean_pos_error_m']:.1f}m | "
+        f"post-confirm cov={diagnostics['manager_post_confirm_coverage']*100:.1f}% | "
+        f"post-miss={diagnostics['manager_post_confirm_miss_rate']*100:.1f}% | "
+        f"early breaks={diagnostics['manager_early_break_count']} | "
+        f"delayed deaths={diagnostics['manager_delayed_death_count']} | "
+        f"delayed frames={diagnostics['manager_delayed_death_frames']} | "
+        f"confirm delay={diagnostics['manager_mean_confirm_delay']:.1f}f | "
         f"BAIT assoc on confirmed={diagnostics['bait_assoc_on_confirmed']*100:.1f}% | "
         f"BAIT pred err={diagnostics['bait_mean_pred_error_m']:.1f}m"
     )
@@ -678,11 +792,20 @@ def evaluate_scenario_kf_managed(
     kf_kwargs = dict(
         tau=tau,
         max_targets=max_targets,
-        max_missed=2,
+        max_missed=3,
         confirm_hits=tau,
-        gate_m=500.0,
+        gate_m=600.0,
         sigma_q_m=50.0,
         sigma_r_m=80.0,
+        tentative_max_missed=1,
+        confirmed_min_max_missed=3,
+        confirmed_gate_scale=1.35,
+        confirmed_protect_frames=1,
+        birth_nms_m=450.0,
+        confirm_nms_m=500.0,
+        max_candidate_tracks=40,
+        max_births_per_frame=5,
+        bait_update_gate_m=900.0,
         dt=1.0,
     )
     if kf_params:
@@ -725,7 +848,7 @@ def evaluate_scenario_kf_managed(
                 if tr.confirmed_frame is not None and tr.confirmed_frame < frame_idx
             ]
 
-            if frame_idx >= tau and eligible_tracks:
+            if frame_idx >= tau and eligible_tracks and n_meas > 0:
                 past_np, n_past = tracker.build_past_states(
                     frame_idx, dt=1.0, total_time=float(max(num_frames, 1))
                 )
@@ -786,6 +909,10 @@ def evaluate_scenario_kf_managed(
                 matched_rows = set()
                 matched_cols = set()
 
+            update_manager_delayed_death_diag(
+                diag, trajectories, pred_slots, matched_rows, slot_to_gt_label, frame_idx
+            )
+
             if frame_idx >= tau:
                 eligible_gt_cols = [
                     j for j, tr in enumerate(active_trajs)
@@ -794,6 +921,9 @@ def evaluate_scenario_kf_managed(
                 diag['phd_expected'] += len(eligible_gt_cols)
                 diag['phd_covered'] += sum(1 for j in eligible_gt_cols if j in matched_cols)
                 diag['phd_false_confirmed'] += max(0, len(pred_items) - len(matched_rows))
+                update_manager_lifecycle_diag(
+                    diag, active_trajs, eligible_gt_cols, matched_cols, frame_idx, tau
+                )
 
                 frame_pred_xyz.append(aligned_pred)
                 frame_true_xyz.append(true_xyz)
@@ -858,7 +988,7 @@ def evaluate_scenario_kf_managed(
                 f"confirmed={len(tracker.confirmed_tracks()):2d} "
                 f"bait={'on' if filtered_np is not None else 'off'} "
                 f"assoc={acc*100:.1f}% "
-                f"kf_cov={(diag['phd_covered']/max(diag['phd_expected'],1))*100:.1f}%" if frame_idx >= tau else
+                f"manager_cov={(diag['phd_covered']/max(diag['phd_expected'],1))*100:.1f}%" if frame_idx >= tau else
                 f"  frame {frame_idx:3d} | kf_est={len(estimates):2d} "
                 f"confirmed={len(tracker.confirmed_tracks()):2d} "
                 f"bait={'on' if filtered_np is not None else 'off'}"
@@ -872,6 +1002,17 @@ def evaluate_scenario_kf_managed(
         'manager_confirm_recall': diag['phd_covered'] / max(diag['phd_expected'], 1),
         'manager_false_confirmed': diag['phd_false_confirmed'],
         'manager_mean_pos_error_m': float(np.mean(diag['phd_pos_errors_m'])) if diag['phd_pos_errors_m'] else float('nan'),
+        'manager_post_confirm_coverage': diag.get('post_covered', 0) / max(diag.get('post_expected', 0), 1),
+        'manager_mean_confirm_delay': float(np.mean(diag.get('confirm_delays', []))) if diag.get('confirm_delays', []) else float('nan'),
+        'manager_confirmed_gt_count': len(diag.get('first_confirm_frame', {})),
+        'manager_post_confirm_miss_rate': diag.get('post_missed', 0) / max(diag.get('post_expected', 0), 1),
+        'manager_early_break_count': len(diag.get('early_broken_labels', set())),
+        'manager_early_break_rate': len(diag.get('early_broken_labels', set())) / max(len(diag.get('first_confirm_frame', {})), 1),
+        'manager_mean_frames_to_break': float(np.mean(diag.get('early_broken_frames', []))) if diag.get('early_broken_frames', []) else float('nan'),
+        'manager_delayed_death_count': len(diag.get('delayed_death_labels', set())),
+        'manager_delayed_death_rate': len(diag.get('delayed_death_labels', set())) / max(len(diag.get('first_confirm_frame', {})), 1),
+        'manager_delayed_death_frames': int(diag.get('delayed_death_total_frames', 0)),
+        'manager_mean_delayed_death': mean_delayed_death_frames(diag),
         'bait_assoc_on_confirmed': diag['bait_assoc_correct'] / max(diag['bait_assoc_total'], 1),
         'bait_assoc_total': diag['bait_assoc_total'],
         'bait_mean_pred_error_m': float(np.mean(diag['bait_pred_errors_m'])) if diag['bait_pred_errors_m'] else float('nan'),
@@ -881,6 +1022,12 @@ def evaluate_scenario_kf_managed(
         f"KF confirm recall={diagnostics['phd_confirm_recall']*100:.1f}% | "
         f"KF false confirmed={diagnostics['phd_false_confirmed']} | "
         f"KF confirmed pos err={diagnostics['phd_mean_pos_error_m']:.1f}m | "
+        f"post-confirm cov={diagnostics['manager_post_confirm_coverage']*100:.1f}% | "
+        f"post-miss={diagnostics['manager_post_confirm_miss_rate']*100:.1f}% | "
+        f"early breaks={diagnostics['manager_early_break_count']} | "
+        f"delayed deaths={diagnostics['manager_delayed_death_count']} | "
+        f"delayed frames={diagnostics['manager_delayed_death_frames']} | "
+        f"confirm delay={diagnostics['manager_mean_confirm_delay']:.1f}f | "
         f"BAIT assoc on confirmed={diagnostics['bait_assoc_on_confirmed']*100:.1f}% | "
         f"BAIT pred err={diagnostics['bait_mean_pred_error_m']:.1f}m"
     )
@@ -933,14 +1080,14 @@ def evaluate_scenario_ltm_managed(
         device=device,
         tau=tau,
         max_targets=max_targets,
-        max_missed=3,
-        gate_m=700.0,
+        max_missed=4,
+        gate_m=900.0,
         sigma_q_m=50.0,
         sigma_r_m=80.0,
-        assoc_threshold=0.45,
-        birth_threshold=0.45,
-        confirm_threshold=0.45,
-        death_threshold=0.65,
+        assoc_threshold=0.35,
+        birth_threshold=0.35,
+        confirm_threshold=0.35,
+        death_threshold=0.75,
         min_confirm_hits=2,
         proposal_birth=True,
         dt=1.0,
@@ -985,7 +1132,7 @@ def evaluate_scenario_ltm_managed(
                 if tr.confirmed_frame is not None and tr.confirmed_frame < frame_idx
             ]
 
-            if frame_idx >= tau and eligible_tracks:
+            if frame_idx >= tau and eligible_tracks and n_meas > 0:
                 past_np, n_past = tracker.build_past_states(
                     frame_idx, dt=1.0, total_time=float(max(num_frames, 1))
                 )
@@ -1046,6 +1193,10 @@ def evaluate_scenario_ltm_managed(
                 matched_rows = set()
                 matched_cols = set()
 
+            update_manager_delayed_death_diag(
+                diag, trajectories, pred_slots, matched_rows, slot_to_gt_label, frame_idx
+            )
+
             if frame_idx >= tau:
                 eligible_gt_cols = [
                     j for j, tr in enumerate(active_trajs)
@@ -1054,6 +1205,9 @@ def evaluate_scenario_ltm_managed(
                 diag['phd_expected'] += len(eligible_gt_cols)
                 diag['phd_covered'] += sum(1 for j in eligible_gt_cols if j in matched_cols)
                 diag['phd_false_confirmed'] += max(0, len(pred_items) - len(matched_rows))
+                update_manager_lifecycle_diag(
+                    diag, active_trajs, eligible_gt_cols, matched_cols, frame_idx, tau
+                )
 
                 frame_pred_xyz.append(aligned_pred)
                 frame_true_xyz.append(true_xyz)
@@ -1132,6 +1286,17 @@ def evaluate_scenario_ltm_managed(
         'manager_confirm_recall': diag['phd_covered'] / max(diag['phd_expected'], 1),
         'manager_false_confirmed': diag['phd_false_confirmed'],
         'manager_mean_pos_error_m': float(np.mean(diag['phd_pos_errors_m'])) if diag['phd_pos_errors_m'] else float('nan'),
+        'manager_post_confirm_coverage': diag.get('post_covered', 0) / max(diag.get('post_expected', 0), 1),
+        'manager_mean_confirm_delay': float(np.mean(diag.get('confirm_delays', []))) if diag.get('confirm_delays', []) else float('nan'),
+        'manager_confirmed_gt_count': len(diag.get('first_confirm_frame', {})),
+        'manager_post_confirm_miss_rate': diag.get('post_missed', 0) / max(diag.get('post_expected', 0), 1),
+        'manager_early_break_count': len(diag.get('early_broken_labels', set())),
+        'manager_early_break_rate': len(diag.get('early_broken_labels', set())) / max(len(diag.get('first_confirm_frame', {})), 1),
+        'manager_mean_frames_to_break': float(np.mean(diag.get('early_broken_frames', []))) if diag.get('early_broken_frames', []) else float('nan'),
+        'manager_delayed_death_count': len(diag.get('delayed_death_labels', set())),
+        'manager_delayed_death_rate': len(diag.get('delayed_death_labels', set())) / max(len(diag.get('first_confirm_frame', {})), 1),
+        'manager_delayed_death_frames': int(diag.get('delayed_death_total_frames', 0)),
+        'manager_mean_delayed_death': mean_delayed_death_frames(diag),
         'bait_assoc_on_confirmed': diag['bait_assoc_correct'] / max(diag['bait_assoc_total'], 1),
         'bait_assoc_total': diag['bait_assoc_total'],
         'bait_mean_pred_error_m': float(np.mean(diag['bait_pred_errors_m'])) if diag['bait_pred_errors_m'] else float('nan'),
@@ -1141,6 +1306,305 @@ def evaluate_scenario_ltm_managed(
         f"LTM confirm recall={diagnostics['phd_confirm_recall']*100:.1f}% | "
         f"LTM false confirmed={diagnostics['phd_false_confirmed']} | "
         f"LTM confirmed pos err={diagnostics['phd_mean_pos_error_m']:.1f}m | "
+        f"post-confirm cov={diagnostics['manager_post_confirm_coverage']*100:.1f}% | "
+        f"post-miss={diagnostics['manager_post_confirm_miss_rate']*100:.1f}% | "
+        f"early breaks={diagnostics['manager_early_break_count']} | "
+        f"delayed deaths={diagnostics['manager_delayed_death_count']} | "
+        f"delayed frames={diagnostics['manager_delayed_death_frames']} | "
+        f"confirm delay={diagnostics['manager_mean_confirm_delay']:.1f}f | "
+        f"BAIT assoc on confirmed={diagnostics['bait_assoc_on_confirmed']*100:.1f}% | "
+        f"BAIT pred err={diagnostics['bait_mean_pred_error_m']:.1f}m"
+    )
+
+    return {
+        'trajectories': trajectories,
+        'measurements': measurements,
+        'gt_associations': gt_associations,
+        'frame_pred_xyz': frame_pred_xyz,
+        'frame_true_xyz': frame_true_xyz,
+        'frame_assoc_acc': frame_assoc_acc,
+        'frame_assoc_detail': frame_assoc_detail,
+        'tau': tau,
+        'num_frames': num_frames,
+        'tracked_states': tracked_states,
+        'diagnostics': diagnostics,
+    }
+
+
+
+def evaluate_scenario_ntm_managed(
+    model,
+    scenario,
+    tau,
+    max_targets,
+    max_measurements,
+    device,
+    scenario_idx,
+    ntm_ckpt_path,
+    ntm_params=None,
+):
+    model.eval()
+    print(f"\n{'='*60}")
+    print(f"Scenario {scenario_idx + 1} | NTM-managed BAIT")
+    print(f"{'='*60}")
+
+    ntm_model, ntm_ckpt = load_ntm_checkpoint(ntm_ckpt_path, device)
+    print(f"NTM checkpoint loaded: {ntm_ckpt_path} (step={ntm_ckpt.get('step', '?')})")
+
+    trajectories, measurements, gt_associations = scenario
+    num_frames = len(measurements)
+
+    for traj in trajectories:
+        traj['states'][:, :3] /= COORD_SCALE
+    for fm in measurements:
+        if len(fm) > 0:
+            fm[:] = fm / COORD_SCALE
+
+    ntm_kwargs = dict(
+        ntm_model=ntm_model,
+        device=device,
+        tau=tau,
+        max_targets=max_targets,
+        max_missed=4,
+        gate_m=900.0,
+        sigma_q_m=50.0,
+        sigma_r_m=80.0,
+        assoc_threshold=0.35,
+        birth_threshold=0.35,
+        confirm_threshold=0.45,
+        death_threshold=0.82,
+        min_confirm_hits=4,
+        proposal_birth=True,
+        max_candidate_tracks=40,
+        birth_nms_m=250.0,
+        max_births_per_frame=8,
+        bait_update_gate_m=1000.0,
+        confirmed_gate_scale=1.5,
+        confirmed_min_max_missed=6,
+        confirmed_death_streak=2,
+        confirmed_protect_frames=3,
+        dt=1.0,
+    )
+    if ntm_params:
+        for key in list(ntm_kwargs.keys()):
+            if key in ntm_params and key not in ("ntm_model", "device"):
+                ntm_kwargs[key] = ntm_params[key]
+
+    tracker = NTMBaitTracker(**ntm_kwargs)
+
+    frame_pred_xyz = []
+    frame_true_xyz = []
+    frame_assoc_acc = []
+    frame_assoc_detail = []
+    tracked_states = {traj['label']: [] for traj in trajectories}
+    diag_gate = 300.0 / COORD_SCALE
+    diag = {
+        'phd_expected': 0,
+        'phd_covered': 0,
+        'phd_false_confirmed': 0,
+        'phd_pos_errors_m': [],
+        'bait_assoc_correct': 0,
+        'bait_assoc_total': 0,
+        'bait_pred_errors_m': [],
+    }
+
+    with torch.no_grad():
+        for frame_idx in range(num_frames):
+            meas_np = prepare_measurements(measurements[frame_idx], max_measurements)
+            n_meas_raw = len(measurements[frame_idx])
+            n_meas = min(n_meas_raw, max_measurements)
+
+            tracker.step(frame_idx, measurements[frame_idx])
+            estimates = [
+                tr.state[:3].copy() for tr in tracker.tracks.values()
+                if tr.status in ("tentative", "confirmed")
+            ]
+
+            eligible_tracks = [
+                tr for tr in tracker.confirmed_tracks()
+                if tr.confirmed_frame is not None and tr.confirmed_frame < frame_idx
+            ]
+
+            if frame_idx >= tau and eligible_tracks and n_meas > 0:
+                past_np, n_past = tracker.build_past_states(
+                    frame_idx, dt=1.0, total_time=float(max(num_frames, 1))
+                )
+                past_t = torch.FloatTensor(past_np).unsqueeze(0).to(device)
+                meas_t = torch.FloatTensor(meas_np).unsqueeze(0).to(device)
+                npast_t = torch.LongTensor([n_past]).to(device)
+                nmeas_t = torch.LongTensor([n_meas]).to(device)
+
+                match_prob, filtered_states, existence_probs = model(
+                    past_t, meas_t, npast_t, nmeas_t
+                )
+                filtered_np = filtered_states[0].cpu().numpy()
+                exist_np = existence_probs[0].cpu().numpy()
+                match_np = match_prob[0].cpu().numpy()
+                tracker.apply_bait_outputs(frame_idx, filtered_np, exist_np)
+            else:
+                filtered_np = None
+                match_np = None
+
+            active_trajs = [
+                tr for tr in trajectories
+                if tr['birth_frame'] <= frame_idx <= tr['death_frame']
+            ]
+            true_xyz = np.array([tr['states'][frame_idx, :3] for tr in active_trajs]) \
+                if active_trajs else np.empty((0, 3))
+
+            pred_items = []
+            pred_slots = []
+            for tr in tracker.confirmed_tracks():
+                if tr.confirmed_frame is not None and tr.confirmed_frame < frame_idx:
+                    xyz = tr.history.get(frame_idx)
+                    if xyz is not None:
+                        pred_items.append(xyz)
+                        pred_slots.append(tr.slot)
+            pred_xyz = np.array(pred_items) if pred_items else np.empty((0, 3))
+            slot_to_gt_label = {}
+
+            if len(pred_xyz) > 0 and len(true_xyz) > 0:
+                cost = np.linalg.norm(pred_xyz[:, None, :] - true_xyz[None, :, :], axis=2)
+                rows, cols = linear_sum_assignment(cost)
+                aligned_pred = np.full_like(true_xyz, np.nan)
+                matched_rows = set()
+                matched_cols = set()
+                for r, c in zip(rows, cols):
+                    if cost[r, c] <= diag_gate:
+                        aligned_pred[c] = pred_xyz[r]
+                        matched_rows.add(int(r))
+                        matched_cols.add(int(c))
+                        diag['phd_pos_errors_m'].append(float(cost[r, c] * COORD_SCALE))
+                        if r < len(pred_slots):
+                            slot_to_gt_label[pred_slots[r]] = active_trajs[c]['label']
+            elif len(true_xyz) > 0:
+                aligned_pred = np.full_like(true_xyz, np.nan)
+                matched_rows = set()
+                matched_cols = set()
+            else:
+                aligned_pred = np.empty((0, 3))
+                matched_rows = set()
+                matched_cols = set()
+
+            update_manager_delayed_death_diag(
+                diag, trajectories, pred_slots, matched_rows, slot_to_gt_label, frame_idx
+            )
+
+            if frame_idx >= tau:
+                eligible_gt_cols = [
+                    j for j, tr in enumerate(active_trajs)
+                    if frame_idx >= int(tr['birth_frame']) + tau
+                ]
+                diag['phd_expected'] += len(eligible_gt_cols)
+                diag['phd_covered'] += sum(1 for j in eligible_gt_cols if j in matched_cols)
+                diag['phd_false_confirmed'] += max(0, len(pred_items) - len(matched_rows))
+                update_manager_lifecycle_diag(
+                    diag, active_trajs, eligible_gt_cols, matched_cols, frame_idx, tau
+                )
+
+                frame_pred_xyz.append(aligned_pred)
+                frame_true_xyz.append(true_xyz)
+
+                if match_np is not None and n_meas > 0:
+                    gt_assoc_frame = gt_associations[frame_idx][:n_meas]
+                    pred_slots_for_meas = np.argmax(match_np[:n_meas, 1:], axis=1)
+                    valid = np.array([
+                        int(lbl) in set(slot_to_gt_label.values())
+                        for lbl in gt_assoc_frame
+                    ], dtype=bool)
+                    correct = 0
+                    detail_rows = []
+                    for mi in np.where(valid)[0]:
+                        slot = int(pred_slots_for_meas[mi])
+                        pred_label = int(slot_to_gt_label.get(slot, -1))
+                        gt_label = int(gt_assoc_frame[mi])
+                        is_correct = pred_label == gt_label
+                        correct += int(is_correct)
+                        diag['bait_assoc_total'] += 1
+                        diag['bait_assoc_correct'] += int(is_correct)
+                        detail_rows.append({
+                            'meas_idx': int(mi),
+                            'pos_real': (measurements[frame_idx][mi] * COORD_SCALE).tolist(),
+                            'pred_label': pred_label,
+                            'gt_label': gt_label,
+                            'correct': bool(is_correct),
+                        })
+                    acc = float(correct / valid.sum()) if valid.sum() > 0 else 0.0
+                else:
+                    acc = 0.0
+                    detail_rows = []
+                frame_assoc_acc.append(acc)
+                frame_assoc_detail.append(detail_rows)
+
+                if filtered_np is not None:
+                    label_to_true = {
+                        int(tr['label']): tr['states'][frame_idx, :3]
+                        for tr in active_trajs
+                    }
+                    for slot, gt_label in slot_to_gt_label.items():
+                        if slot is None or slot >= len(filtered_np) or gt_label not in label_to_true:
+                            continue
+                        err_m = np.linalg.norm(
+                            (filtered_np[int(slot)] - label_to_true[int(gt_label)]) * COORD_SCALE
+                        )
+                        if not np.isnan(err_m):
+                            diag['bait_pred_errors_m'].append(float(err_m))
+
+            active_label_to_idx = {
+                tr['label']: j for j, tr in enumerate(active_trajs)
+            }
+            for tr in trajectories:
+                j = active_label_to_idx.get(tr['label'])
+                if frame_idx >= tau and j is not None and j < len(aligned_pred):
+                    tracked_states[tr['label']].append(aligned_pred[j].copy())
+                else:
+                    tracked_states[tr['label']].append(np.zeros(3))
+
+            print(
+                f"  frame {frame_idx:3d} | ntm_est={len(estimates):2d} "
+                f"confirmed={len(tracker.confirmed_tracks()):2d} "
+                f"bait={'on' if filtered_np is not None else 'off'} "
+                f"assoc={acc*100:.1f}% "
+                f"ntm_cov={(diag['phd_covered']/max(diag['phd_expected'],1))*100:.1f}%" if frame_idx >= tau else
+                f"  frame {frame_idx:3d} | ntm_est={len(estimates):2d} "
+                f"confirmed={len(tracker.confirmed_tracks()):2d} "
+                f"bait={'on' if filtered_np is not None else 'off'}"
+            )
+
+    diagnostics = {
+        'manager': 'NTM',
+        'phd_confirm_recall': diag['phd_covered'] / max(diag['phd_expected'], 1),
+        'phd_false_confirmed': diag['phd_false_confirmed'],
+        'phd_mean_pos_error_m': float(np.mean(diag['phd_pos_errors_m'])) if diag['phd_pos_errors_m'] else float('nan'),
+        'manager_confirm_recall': diag['phd_covered'] / max(diag['phd_expected'], 1),
+        'manager_false_confirmed': diag['phd_false_confirmed'],
+        'manager_mean_pos_error_m': float(np.mean(diag['phd_pos_errors_m'])) if diag['phd_pos_errors_m'] else float('nan'),
+        'manager_post_confirm_coverage': diag.get('post_covered', 0) / max(diag.get('post_expected', 0), 1),
+        'manager_mean_confirm_delay': float(np.mean(diag.get('confirm_delays', []))) if diag.get('confirm_delays', []) else float('nan'),
+        'manager_confirmed_gt_count': len(diag.get('first_confirm_frame', {})),
+        'manager_post_confirm_miss_rate': diag.get('post_missed', 0) / max(diag.get('post_expected', 0), 1),
+        'manager_early_break_count': len(diag.get('early_broken_labels', set())),
+        'manager_early_break_rate': len(diag.get('early_broken_labels', set())) / max(len(diag.get('first_confirm_frame', {})), 1),
+        'manager_mean_frames_to_break': float(np.mean(diag.get('early_broken_frames', []))) if diag.get('early_broken_frames', []) else float('nan'),
+        'manager_delayed_death_count': len(diag.get('delayed_death_labels', set())),
+        'manager_delayed_death_rate': len(diag.get('delayed_death_labels', set())) / max(len(diag.get('first_confirm_frame', {})), 1),
+        'manager_delayed_death_frames': int(diag.get('delayed_death_total_frames', 0)),
+        'manager_mean_delayed_death': mean_delayed_death_frames(diag),
+        'bait_assoc_on_confirmed': diag['bait_assoc_correct'] / max(diag['bait_assoc_total'], 1),
+        'bait_assoc_total': diag['bait_assoc_total'],
+        'bait_mean_pred_error_m': float(np.mean(diag['bait_pred_errors_m'])) if diag['bait_pred_errors_m'] else float('nan'),
+    }
+    print(
+        "\n[NTM+BAIT diagnostics] "
+        f"NTM confirm recall={diagnostics['phd_confirm_recall']*100:.1f}% | "
+        f"NTM false confirmed={diagnostics['phd_false_confirmed']} | "
+        f"NTM confirmed pos err={diagnostics['phd_mean_pos_error_m']:.1f}m | "
+        f"post-confirm cov={diagnostics['manager_post_confirm_coverage']*100:.1f}% | "
+        f"post-miss={diagnostics['manager_post_confirm_miss_rate']*100:.1f}% | "
+        f"early breaks={diagnostics['manager_early_break_count']} | "
+        f"delayed deaths={diagnostics['manager_delayed_death_count']} | "
+        f"delayed frames={diagnostics['manager_delayed_death_frames']} | "
+        f"confirm delay={diagnostics['manager_mean_confirm_delay']:.1f}f | "
         f"BAIT assoc on confirmed={diagnostics['bait_assoc_on_confirmed']*100:.1f}% | "
         f"BAIT pred err={diagnostics['bait_mean_pred_error_m']:.1f}m"
     )
@@ -1637,3 +2101,9 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+

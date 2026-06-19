@@ -19,10 +19,16 @@ class KFBAITTrack:
     last_frame: int | None = None
     miss_streak: int = 0
     hit_streak: int = 0
+    total_hits: int = 0
 
     def add_state(self, frame_idx, xyz):
         self.history[int(frame_idx)] = np.asarray(xyz, dtype=np.float32).copy()
         self.last_frame = int(frame_idx)
+
+    def age(self, frame_idx):
+        if self.birth_frame is None:
+            return 0
+        return max(0, int(frame_idx) - int(self.birth_frame) + 1)
 
 
 class KFBAITTracker:
@@ -30,12 +36,21 @@ class KFBAITTracker:
         self,
         tau=4,
         max_targets=20,
-        max_missed=2,
+        max_missed=3,
         confirm_hits=None,
         gate_m=500.0,
         sigma_q_m=50.0,
         sigma_r_m=80.0,
         dt=1.0,
+        tentative_max_missed=1,
+        confirmed_min_max_missed=3,
+        confirmed_gate_scale=1.35,
+        confirmed_protect_frames=1,
+        birth_nms_m=450.0,
+        confirm_nms_m=500.0,
+        max_candidate_tracks=40,
+        max_births_per_frame=5,
+        bait_update_gate_m=900.0,
     ):
         self.tau = int(tau)
         self.max_targets = int(max_targets)
@@ -45,6 +60,15 @@ class KFBAITTracker:
         self.dt = float(dt)
         self.sigma_q = float(sigma_q_m) / COORD_SCALE
         self.sigma_r = float(sigma_r_m) / COORD_SCALE
+        self.tentative_max_missed = int(tentative_max_missed)
+        self.confirmed_max_missed = max(int(max_missed), int(confirmed_min_max_missed))
+        self.confirmed_gate_scale = float(confirmed_gate_scale)
+        self.confirmed_protect_frames = int(confirmed_protect_frames)
+        self.birth_nms = float(birth_nms_m) / COORD_SCALE
+        self.confirm_nms = float(confirm_nms_m) / COORD_SCALE
+        self.max_candidate_tracks = int(max_candidate_tracks)
+        self.max_births_per_frame = int(max_births_per_frame)
+        self.bait_update_gate = float(bait_update_gate_m) / COORD_SCALE
 
         self.F = np.eye(6, dtype=np.float64)
         self.F[0, 3] = self.dt
@@ -61,6 +85,12 @@ class KFBAITTracker:
         self.next_slot = 0
 
     def _new_track(self, frame_idx, z):
+        live_count = sum(
+            1 for tr in self.tracks.values()
+            if tr.status in ("tentative", "confirmed")
+        )
+        if live_count >= self.max_candidate_tracks:
+            return
         x = np.zeros(6, dtype=np.float64)
         x[:3] = z
         v_init = 500.0 / COORD_SCALE
@@ -72,6 +102,7 @@ class KFBAITTracker:
             birth_frame=int(frame_idx),
             last_frame=int(frame_idx),
             hit_streak=1,
+            total_hits=1,
         )
         self.next_track_id += 1
         tr.add_state(frame_idx, x[:3])
@@ -102,15 +133,21 @@ class KFBAITTracker:
             pred = np.array([tr.x[:3] for tr in live_tracks])
             meas = np.array(measurements)
             cost = np.linalg.norm(pred[:, None, :] - meas[None, :, :], axis=2)
-            rows, cols = linear_sum_assignment(cost)
+            gated_cost = cost.copy()
+            for r, tr in enumerate(live_tracks):
+                gate = self.gate * (self.confirmed_gate_scale if tr.status == "confirmed" else 1.0)
+                gated_cost[r, gated_cost[r] > gate] = 1e6
+            rows, cols = linear_sum_assignment(gated_cost)
             for r, c in zip(rows, cols):
-                if cost[r, c] > self.gate:
-                    continue
                 tr = live_tracks[r]
+                gate = self.gate * (self.confirmed_gate_scale if tr.status == "confirmed" else 1.0)
+                if cost[r, c] > gate:
+                    continue
                 self._update_track(tr, measurements[c])
                 tr.add_state(frame_idx, tr.x[:3])
                 tr.miss_streak = 0
                 tr.hit_streak += 1
+                tr.total_hits += 1
                 assigned_tracks.add(tr.track_id)
                 assigned_meas.add(c)
 
@@ -121,12 +158,28 @@ class KFBAITTracker:
             tr.hit_streak = 0
             if tr.status == "confirmed":
                 tr.add_state(frame_idx, tr.x[:3])
-            if tr.miss_streak > self.max_missed:
+                protect_until = int(tr.confirmed_frame or frame_idx) + self.confirmed_protect_frames
+                if frame_idx > protect_until and tr.miss_streak > self.confirmed_max_missed:
+                    tr.status = "dead"
+                continue
+            if tr.miss_streak > self.tentative_max_missed:
                 tr.status = "dead"
 
+        live_xyz = [
+            tr.x[:3] for tr in self.tracks.values()
+            if tr.status in ("tentative", "confirmed")
+        ]
+        births = 0
         for i, z in enumerate(measurements):
             if i not in assigned_meas:
+                if births >= self.max_births_per_frame:
+                    break
+                too_close = any(np.linalg.norm(z - xyz) < self.birth_nms for xyz in live_xyz)
+                if too_close:
+                    continue
                 self._new_track(frame_idx, z)
+                live_xyz.append(z)
+                births += 1
 
         self._confirm_ready_tracks(frame_idx)
 
@@ -140,8 +193,19 @@ class KFBAITTracker:
                 break
             if tr.hit_streak < self.confirm_hits:
                 continue
+            if tr.total_hits < self.confirm_hits:
+                continue
             needed = range(frame_idx - self.tau + 1, frame_idx + 1)
             if not all(t in tr.history for t in needed):
+                continue
+            duplicate_confirmed = any(
+                other.track_id != tr.track_id
+                and other.status == "confirmed"
+                and np.linalg.norm(other.x[:3] - tr.x[:3]) < self.confirm_nms
+                for other in self.tracks.values()
+            )
+            if duplicate_confirmed:
+                tr.status = "dead"
                 continue
             tr.status = "confirmed"
             tr.confirmed_frame = int(frame_idx)
@@ -178,11 +242,16 @@ class KFBAITTracker:
                 continue
             if existence_probs is not None and existence_probs[tr.slot] < exist_threshold:
                 tr.miss_streak += 1
-                if tr.miss_streak > self.max_missed:
+                protect_until = int(tr.confirmed_frame or frame_idx) + self.confirmed_protect_frames
+                if frame_idx > protect_until and tr.miss_streak > self.confirmed_max_missed:
                     tr.status = "dead"
                 continue
             xyz = np.asarray(filtered_states[tr.slot], dtype=np.float64)
+            if np.linalg.norm(xyz - tr.x[:3]) > self.bait_update_gate:
+                continue
+            prev_xyz = tr.history.get(frame_idx - 1, tr.x[:3])
+            tr.x[3:6] = xyz - prev_xyz
             tr.x[:3] = xyz
             tr.add_state(frame_idx, xyz)
             tr.miss_streak = 0
-
+            tr.hit_streak = max(tr.hit_streak, 1)

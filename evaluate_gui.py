@@ -41,6 +41,7 @@ from evaluate_3d import (
     evaluate_scenario_phd_managed,
     evaluate_scenario_kf_managed,
     evaluate_scenario_ltm_managed,
+    evaluate_scenario_ntm_managed,
     plot_3d_trajectories,
     plot_error_curves,
     plot_ospa_curve,
@@ -128,6 +129,7 @@ class EvaluateGUI:
             'BAIT': 'BAIT(GT)',
             'KF+BAIT': 'KF+BAIT',
             'LTM+BAIT': 'LTM+BAIT',
+            'NTM+BAIT': 'NTM+BAIT',
             'PHD+BAIT': 'PHD+BAIT',
             'MHT': 'MHT',
             'PHD': 'PHD',
@@ -180,11 +182,11 @@ class EvaluateGUI:
         kf_col2 = ttk.Frame(self._kf_frame)
         kf_col2.pack(side='left')
 
-        self._kf_gate      = self._flt_row(kf_col1, '关联门限 gate (m)',       500.0,  50.0, 2000.0, 0)
+        self._kf_gate      = self._flt_row(kf_col1, '关联门限 gate (m)',       600.0,  50.0, 2000.0, 0)
         self._kf_sigma_r   = self._flt_row(kf_col1, '测量噪声 sigma_r (m)',     80.0,   1.0,  500.0, 1)
         self._kf_sigma_q   = self._flt_row(kf_col1, '过程噪声 sigma_q (m)',     50.0,   1.0,  500.0, 2)
         self._kf_confirm   = self._int_row(kf_col2, '确认帧数',                    4,     2,     10, 0)
-        self._kf_delete    = self._int_row(kf_col2, '删除漏检帧数',                2,     1,     10, 1)
+        self._kf_delete    = self._int_row(kf_col2, '删除漏检帧数',                3,     1,     10, 1)
 
         # ── LTM+BAIT 专属面板：参数 ──────────────────────────
         self._ltm_frame = ttk.LabelFrame(self.root, text='LTM+BAIT — 智能航迹管理参数', padding=8)
@@ -210,6 +212,29 @@ class EvaluateGUI:
         self._ltm_confirm   = self._flt_row(ltm_col2, '确认阈值 confirm',           0.35,  0.05,   0.95, 1)
         self._ltm_death     = self._flt_row(ltm_col2, '删除阈值 death',             0.75,  0.05,   0.95, 2)
         self._ltm_delete    = self._int_row(ltm_col2, '最大漏检帧数',                 4,     1,     10, 3)
+
+        # ── NTM+BAIT 专属面板：参数 ──────────────────────────
+        self._ntm_frame = ttk.LabelFrame(self.root, text='NTM+BAIT — 端到端航迹管理参数', padding=8)
+        ntm_top = ttk.Frame(self._ntm_frame)
+        ntm_top.pack(fill='x', pady=(0, 6))
+        self._ntm_ckpt_var = tk.StringVar(
+            value=os.path.join('checkpoints_ntm', 'best_ntm.pth'))
+        ttk.Label(ntm_top, text='NTM 检查点', width=14, anchor='w').pack(side='left')
+        ttk.Entry(ntm_top, textvariable=self._ntm_ckpt_var, width=54).pack(
+            side='left', padx=(0, 6))
+        ttk.Button(ntm_top, text='浏览…', command=self._browse_ntm_ckpt).pack(side='left')
+
+        ntm_col1 = ttk.Frame(self._ntm_frame)
+        ntm_col1.pack(side='left', padx=(0, 20))
+        ntm_col2 = ttk.Frame(self._ntm_frame)
+        ntm_col2.pack(side='left')
+
+        self._ntm_gate      = self._flt_row(ntm_col1, '关联门限 gate (m)',       900.0,  50.0, 2000.0, 0)
+        self._ntm_assoc     = self._flt_row(ntm_col1, '关联阈值 assoc',            0.35,  0.05,   0.95, 1)
+        self._ntm_birth     = self._flt_row(ntm_col1, '新生阈值 birth',             0.35,  0.05,   0.95, 2)
+        self._ntm_confirm   = self._flt_row(ntm_col2, '确认阈值 confirm',           0.45,  0.05,   0.95, 0)
+        self._ntm_death     = self._flt_row(ntm_col2, '删除阈值 death',             0.82,  0.05,   0.95, 1)
+        self._ntm_delete    = self._int_row(ntm_col2, '最大漏检帧数',                 4,     1,     10, 2)
 
         # ── PHD 专属面板：参数 ───────────────────────────────
         self._phd_frame = ttk.LabelFrame(self.root, text='PHD — 算法参数', padding=8)
@@ -370,7 +395,7 @@ class EvaluateGUI:
 
     def _on_algo_change(self):
         algo = self._algo_var.get()
-        for w in (self._bait_frame, self._kf_frame, self._ltm_frame,
+        for w in (self._bait_frame, self._kf_frame, self._ltm_frame, self._ntm_frame,
                   self._mht_frame, self._phd_frame, self._jpda_frame):
             w.pack_forget()
         if algo == 'BAIT':
@@ -381,6 +406,9 @@ class EvaluateGUI:
         elif algo == 'LTM+BAIT':
             self._bait_frame.pack(fill='x', padx=10, pady=4)
             self._ltm_frame.pack(fill='x', padx=10, pady=4)
+        elif algo == 'NTM+BAIT':
+            self._bait_frame.pack(fill='x', padx=10, pady=4)
+            self._ntm_frame.pack(fill='x', padx=10, pady=4)
         elif algo == 'PHD+BAIT':
             self._bait_frame.pack(fill='x', padx=10, pady=4)
             self._phd_frame.pack(fill='x', padx=10, pady=4)
@@ -415,6 +443,14 @@ class EvaluateGUI:
         )
         if path:
             self._ltm_ckpt_var.set(path)
+
+    def _browse_ntm_ckpt(self):
+        path = filedialog.askopenfilename(
+            title='选择 NTM 检查点',
+            filetypes=[('PyTorch checkpoint', '*.pth'), ('All files', '*.*')],
+        )
+        if path:
+            self._ntm_ckpt_var.set(path)
 
     def _on_run(self):
         if self._thread and self._thread.is_alive():
@@ -452,7 +488,7 @@ class EvaluateGUI:
             extra['spindle_crossing'] = (None if cv == 'random' else cv == 'yes')
 
         # BAIT 需要检查点文件
-        if algo in ('BAIT', 'KF+BAIT', 'LTM+BAIT', 'PHD+BAIT'):
+        if algo in ('BAIT', 'KF+BAIT', 'LTM+BAIT', 'NTM+BAIT', 'PHD+BAIT'):
             ckpt = self._ckpt_var.get().strip()
             if not os.path.isfile(ckpt):
                 messagebox.showerror('文件不存在', f'找不到检查点文件：\n{ckpt}')
@@ -464,6 +500,11 @@ class EvaluateGUI:
             ltm_ckpt = self._ltm_ckpt_var.get().strip()
             if not os.path.isfile(ltm_ckpt):
                 messagebox.showerror('文件不存在', f'找不到 LTM 检查点文件：\n{ltm_ckpt}')
+                return
+        if algo == 'NTM+BAIT':
+            ntm_ckpt = self._ntm_ckpt_var.get().strip()
+            if not os.path.isfile(ntm_ckpt):
+                messagebox.showerror('文件不存在', f'找不到 NTM 检查点文件：\n{ntm_ckpt}')
                 return
 
         self._run_btn.config(state='disabled')
@@ -504,6 +545,21 @@ class EvaluateGUI:
                 death_threshold   = self._ltm_death.get(),
                 max_missed        = self._ltm_delete.get(),
                 proposal_birth    = True,
+            )
+        elif algo == 'NTM+BAIT':
+            algo_params = dict(
+                ntm_ckpt_path     = self._ntm_ckpt_var.get().strip(),
+                gate_m            = self._ntm_gate.get(),
+                assoc_threshold   = self._ntm_assoc.get(),
+                birth_threshold   = self._ntm_birth.get(),
+                confirm_threshold = self._ntm_confirm.get(),
+                death_threshold   = self._ntm_death.get(),
+                max_missed        = self._ntm_delete.get(),
+                proposal_birth    = True,
+                max_candidate_tracks = 40,
+                birth_nms_m       = 250.0,
+                max_births_per_frame = 8,
+                bait_update_gate_m = 1000.0,
             )
         elif algo in ('PHD', 'PHD+BAIT'):
             algo_params = dict(
@@ -584,6 +640,8 @@ class EvaluateGUI:
                 result = self._run_bait(ckpt_path, scenario, kf_managed=True, kf_params=algo_params)
             elif algo == 'LTM+BAIT':
                 result = self._run_bait(ckpt_path, scenario, ltm_managed=True, ltm_params=algo_params)
+            elif algo == 'NTM+BAIT':
+                result = self._run_bait(ckpt_path, scenario, ntm_managed=True, ntm_params=algo_params)
             elif algo == 'PHD+BAIT':
                 result = self._run_bait(ckpt_path, scenario, phd_managed=True, phd_params=algo_params)
             elif algo == 'MHT':
@@ -651,9 +709,25 @@ class EvaluateGUI:
                 recall = d.get('manager_confirm_recall', d.get('phd_confirm_recall', 0.0))
                 false_confirmed = d.get('manager_false_confirmed', d.get('phd_false_confirmed', 0))
                 manager_err = d.get('manager_mean_pos_error_m', d.get('phd_mean_pos_error_m', float('nan')))
+                post_cov = d.get('manager_post_confirm_coverage', 0.0)
+                post_miss = d.get('manager_post_confirm_miss_rate', 0.0)
+                confirm_delay = d.get('manager_mean_confirm_delay', float('nan'))
+                early_breaks = d.get('manager_early_break_count', 0)
+                early_break_rate = d.get('manager_early_break_rate', 0.0)
+                delayed_deaths = d.get('manager_delayed_death_count', 0)
+                delayed_death_rate = d.get('manager_delayed_death_rate', 0.0)
+                delayed_death_frames = d.get('manager_delayed_death_frames', 0)
+                mean_delayed_death = d.get('manager_mean_delayed_death', float('nan'))
                 print(
                     '[分层诊断] '
                     f"{manager}确认覆盖率={recall*100:.1f}% | "
+                    f"{manager}确认后覆盖={post_cov*100:.1f}% | "
+                    f"{manager}确认后漏失={post_miss*100:.1f}% | "
+                    f"{manager}提前断轨={early_breaks}({early_break_rate*100:.1f}%) | "
+                    f"{manager}延迟结束={delayed_deaths}({delayed_death_rate*100:.1f}%) | "
+                    f"{manager}延迟结束帧={delayed_death_frames} | "
+                    f"{manager}平均延迟结束={mean_delayed_death:.1f}帧 | "
+                    f"{manager}平均确认延迟={confirm_delay:.1f}帧 | "
                     f"{manager}虚警确认={false_confirmed} | "
                     f"{manager}确认位置误差={manager_err:.1f}m | "
                     f"BAIT条件关联={d.get('bait_assoc_on_confirmed', 0.0)*100:.1f}% | "
@@ -684,6 +758,8 @@ class EvaluateGUI:
         kf_params=None,
         ltm_managed=False,
         ltm_params=None,
+        ntm_managed=False,
+        ntm_params=None,
     ):
         """加载 BAIT 模型并运行评估。"""
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -707,6 +783,17 @@ class EvaluateGUI:
                 device=device, scenario_idx=0,
                 ltm_ckpt_path=ltm_ckpt_path,
                 ltm_params=ltm_kwargs,
+            )
+        if ntm_managed:
+            ntm_kwargs = dict(ntm_params or {})
+            ntm_ckpt_path = ntm_kwargs.pop('ntm_ckpt_path')
+            return evaluate_scenario_ntm_managed(
+                model, copy.deepcopy(scenario),
+                tau=4, max_targets=20,
+                max_measurements=eval_max_measurements,
+                device=device, scenario_idx=0,
+                ntm_ckpt_path=ntm_ckpt_path,
+                ntm_params=ntm_kwargs,
             )
         if kf_managed:
             return evaluate_scenario_kf_managed(
@@ -757,9 +844,15 @@ class EvaluateGUI:
                     d = s['diagnostics']
                     manager = d.get('manager', 'PHD')
                     recall = d.get('manager_confirm_recall', d.get('phd_confirm_recall', 0.0))
+                    post_cov = d.get('manager_post_confirm_coverage', 0.0)
+                    early_breaks = d.get('manager_early_break_count', 0)
+                    delayed_deaths = d.get('manager_delayed_death_count', 0)
                     self._summary_var.set(
                         self._summary_var.get()
                         + f"    {manager}覆盖: {recall*100:.1f}%"
+                        + f"    确认后覆盖: {post_cov*100:.1f}%"
+                        + f"    提前断轨: {early_breaks}"
+                        + f"    延迟结束: {delayed_deaths}"
                         + f"    BAIT条件关联: {d.get('bait_assoc_on_confirmed', 0.0)*100:.1f}%"
                     )
                 if res['plot_paths']:
